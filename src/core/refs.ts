@@ -21,14 +21,26 @@
 
 export const REF_SCHEME = "cmv3";
 
-export type RefKind = "tool" | "checkpoint" | "session" | "file";
+export type RefKind = "tool" | "checkpoint" | "session" | "file" | "handoff";
 
 export const REF_KINDS: readonly RefKind[] = Object.freeze([
 	"tool",
 	"checkpoint",
 	"session",
 	"file",
+	"handoff",
 ]);
+
+/**
+ * CMV3-S02 change-control note:
+ *
+ * The `handoff` family was added in S02 because handoffs are
+ * independently recoverable durable records, not sub-records of a
+ * checkpoint. The R02 change-control rule allows extension of the
+ * frozen ref model if documented; this comment is the
+ * documentation. Existing ref syntax (tool / checkpoint / session /
+ * file) is unchanged and remains parseable.
+ */
 
 /**
  * Strict opaque id alphabet: lowercase letters, digits, and `-` or `_`.

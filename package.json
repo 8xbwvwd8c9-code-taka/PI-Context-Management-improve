@@ -21,13 +21,16 @@
     "./adapters": {
       "types": "./dist/adapters/index.d.ts",
       "import": "./dist/adapters/index.js"
+    },
+    "./store": {
+      "types": "./dist/store/index.d.ts",
+      "import": "./dist/store/index.js"
     }
   },
   "files": [
     "dist",
     "skills",
-    "README.md",
-    "LICENSE"
+    "README.md"
   ],
   "keywords": [
     "pi-package",

@@ -4,8 +4,8 @@
 | --- | --- | --- |
 | R01 — research / provenance | ✅ done | External repository assimilation + license classification (`docs/research/CMV3_PORTABLE_ASSIMILATION.md`) |
 | R02 — architecture freeze | ✅ done | Frozen contracts: profiles, pressure, checkpoint, handoff, ref, tool-result, storage, modes (`docs/CMV3_PORTABLE_ARCHITECTURE_FREEZE.md`) |
-| **S01 — portable package skeleton** | **in progress** | Combined Skill + Extension package, portable core, schemas, tests |
-| S02 — checkpoint / handoff / history | next | Writers + readers + durable project / session state |
+| S01 — portable package skeleton | ✅ done | Combined Skill + Extension package, portable core, schemas, tests |
+| **S02 — checkpoint / handoff / history** | **in progress** | Durable store: checkpoints, handoffs, sessions, project metadata, history, recovery |
 | S03 — tool-result virtualization | next | Refs-backed tool result durability, integrity verification, on-demand recovery |
 | S04 — fresh-session rollover | next | Natural + pressure rollover orchestrator, mode-gated |
 | P01 — ST_BOT pilot | planned | First portability acceptance test |

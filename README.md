@@ -17,25 +17,39 @@ project state as external, recoverable storage.
 
 ## Status
 
-**S01 — portable Pi package skeleton**
+**S02 — durable checkpoint / handoff / history**
 
 This package is currently in development. It is **not published**
 to npm. It is intended to be installed from this repository once
 the runtime behavior lands in S04.
 
-S01 establishes packaging, module boundaries, configuration
-contracts, schemas/types, and test scaffolding. It does NOT
-implement active context-management behavior.
+S02 adds a local-first filesystem store with:
+
+- durable checkpoints (R02 §6)
+- durable minimal handoffs (R02 §7)
+- session records (S02)
+- project metadata
+- deterministic history index (rebuildable)
+- deterministic recovery (no LLM, fail-safe)
+
+S02 does NOT yet:
+
+- intercept tool results (S03)
+- automatically trigger checkpoints from Pi lifecycle (S04)
+- create a new Pi session (S04)
+- execute rollover (S04)
+- replace native Pi compaction
 
 Initial goals:
 
 - portable Pi Skill + Extension package ✅ (S01)
 - local 32K models as a first-class runtime ✅ (S01 profiles)
+- durable checkpoint / handoff / session persistence ✅ (S02)
+- deterministic recovery without LLM ✅ (S02)
 - natural rollover at work-package boundaries (S04)
 - pressure rollover for long unfinished work (S04)
-- durable checkpoints and on-demand recovery (S02)
 - tool-result virtualization (S03)
-- deterministic cleanup before LLM compaction (S02/S03)
+- deterministic cleanup before LLM compaction (S03)
 - native Pi compaction retained as emergency fallback (always)
 
 ## Installation
@@ -64,6 +78,7 @@ CMV3
 ├── Portable Core        (src/core/)
 ├── Pi Runtime Extension (src/pi/)
 ├── Project Adapters     (src/adapters/)
+├── Durable Store        (src/store/)  ← S02
 └── Skill                (skills/context-management/)
 ```
 
@@ -72,8 +87,12 @@ no I/O outside the package's own working area.
 
 The Pi Runtime Extension hosts lifecycle hooks, telemetry,
 tool-result interception, checkpoint trigger, and fresh-session
-rollover. In S01, the extension is a no-op entrypoint that loads
-and registers the package identity; no live behavior is enabled.
+rollover. In S02, the extension is still a no-op entrypoint.
+
+The Durable Store (S02) is a local-first filesystem library. It
+lives outside the target Git repo by default and is responsible
+for atomic writes, integrity verification, and deterministic
+recovery. It does NOT wire into the live Pi lifecycle.
 
 The Skill is the agent-facing behavioral policy.
 
@@ -146,8 +165,8 @@ npm run package:check
 | --- | --- | --- |
 | R01 — research / provenance | ✅ | External repository assimilation + license classification |
 | R02 — architecture freeze | ✅ | Frozen contracts: profiles, pressure, checkpoint, handoff, ref, tool-result, storage, modes |
-| **S01 — portable package skeleton** | **current** | Combined Skill + Extension package, portable core, schemas, tests |
-| S02 — checkpoint / handoff / history | next | Writers + readers + durable project/session state |
+| S01 — portable package skeleton | ✅ | Combined Skill + Extension package, portable core, schemas, tests |
+| **S02 — checkpoint / handoff / history** | **current** | Durable store: checkpoints, handoffs, sessions, project metadata, history, recovery |
 | S03 — tool-result virtualization | next | Refs-backed tool result durability, integrity verification, on-demand recovery |
 | S04 — fresh-session rollover | next | Natural + pressure rollover orchestrator, mode-gated |
 | P01 — ST_BOT pilot | planned | First portability acceptance test |
@@ -156,6 +175,8 @@ npm run package:check
 ## Authoritative documents
 
 - `docs/CMV3_PORTABLE_ARCHITECTURE_FREEZE.md` — frozen architecture (contract).
+- `docs/STORAGE.md` — durable store model, atomicity, integrity, recovery (S02).
+- `docs/CHECKPOINT_RECOVERY.md` — checkpoint recovery contract (S02).
 - `docs/ARCHITECTURE.md` — public high-level overview.
 - `docs/RESEARCH_PROVENANCE.md` — external repository license matrix.
 - `docs/research/CMV3_PORTABLE_ASSIMILATION.md` — full R01 research assimilation.

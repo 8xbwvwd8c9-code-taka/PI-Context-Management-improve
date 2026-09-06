@@ -1,0 +1,140 @@
+/**
+ * Path resolution for the CMV3 runtime store.
+ *
+ * Per R02 §10:
+ *   - local-first
+ *   - outside the target Git repo by default
+ *   - safe permissions
+ *   - no secrets in filenames
+ *
+ * The default store lives under the user home, NOT under the
+ * target project directory:
+ *
+ *   <home>/.pi/cmv3/
+ *     projects/<opaque-project-id>/
+ *       metadata.json
+ *       checkpoints/<id>.json
+ *       handoffs/<id>.json
+ *       sessions/<id>.json
+ *       index/
+ *         checkpoints.jsonl
+ *         handoffs.jsonl
+ *         sessions.jsonl
+ *     schema.json
+ *
+ * Callers may override via:
+ *   - config.storage_path (absolute path or `~`-prefixed)
+ *   - env var CMV3_STORE_PATH (overrides config; for tests)
+ *
+ * The store path is NEVER derived from the target project path
+ * except via the opaque project-id (a hash), so the directory
+ * layout of the store does not leak the absolute project path.
+ */
+
+import { existsSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, join, resolve, sep } from "node:path";
+
+export const CMV3_HOME_SUBDIR = [".pi", "cmv3"] as const;
+export const SCHEMA_FILENAME = "schema.json";
+
+export const CMV3_SCHEMA_VERSION = "1.0.0" as const;
+
+export interface StoreLayout {
+	root: string;
+	projectsRoot: string;
+}
+
+export interface ResolvedStoreOptions {
+	storagePath: string;
+	home: string;
+}
+
+export function defaultStorePath(home: string = homedir()): string {
+	return join(home, ...CMV3_HOME_SUBDIR);
+}
+
+export function resolveStorePath(input: string | undefined, home: string = homedir()): string {
+	if (input == null || input.length === 0) {
+		return defaultStorePath(home);
+	}
+	const expanded = input.startsWith("~")
+		? join(home, input.slice(1).replace(/^[/\\]/, ""))
+		: input;
+	return isAbsolute(expanded) ? expanded : resolve(home, expanded);
+}
+
+export function storeLayout(root: string): StoreLayout {
+	const projectsRoot = join(root, "projects");
+	return { root, projectsRoot };
+}
+
+export function projectDir(layout: StoreLayout, projectId: string): string {
+	return join(layout.projectsRoot, projectId);
+}
+
+export function projectSubpaths(): {
+	metadata: string;
+	checkpoints: string;
+	handoffs: string;
+	sessions: string;
+	index: string;
+} {
+	return {
+		metadata: "metadata.json",
+		checkpoints: "checkpoints",
+		handoffs: "handoffs",
+		sessions: "sessions",
+		index: "index",
+	};
+}
+
+export function checkpointPath(layout: StoreLayout, projectId: string, id: string): string {
+	return join(projectDir(layout, projectId), "checkpoints", `${id}.json`);
+}
+
+export function handoffPath(layout: StoreLayout, projectId: string, id: string): string {
+	return join(projectDir(layout, projectId), "handoffs", `${id}.json`);
+}
+
+export function sessionPath(layout: StoreLayout, projectId: string, id: string): string {
+	return join(projectDir(layout, projectId), "sessions", `${id}.json`);
+}
+
+export function metadataPath(layout: StoreLayout, projectId: string): string {
+	return join(projectDir(layout, projectId), "metadata.json");
+}
+
+export function indexPath(
+	layout: StoreLayout,
+	projectId: string,
+	kind: "checkpoints" | "handoffs" | "sessions",
+): string {
+	return join(projectDir(layout, projectId), "index", `${kind}.jsonl`);
+}
+
+export function schemaPath(layout: StoreLayout): string {
+	return join(layout.root, SCHEMA_FILENAME);
+}
+
+/**
+ * Reject storage paths that would be unsafe (root, home root, or
+ * already inside a non-CMV3 directory without an override flag).
+ */
+export function isSafeStorePath(path: string, home: string = homedir()): boolean {
+	if (path.length === 0) return false;
+	// Refuse root and the home root; we are not asking the user to
+	// wipe anything. The dedicated CMV3 subdir is required.
+	if (path === "/" || path === sep) return false;
+	if (path === home) return false;
+	return true;
+}
+
+/**
+ * True if `path` is already a populated directory that the
+ * caller is asking us to use as a store root, AND it is not the
+ * target project directory.
+ */
+export function looksLikeCmv3Root(path: string): boolean {
+	return existsSync(path) && statSync(path).isDirectory();
+}

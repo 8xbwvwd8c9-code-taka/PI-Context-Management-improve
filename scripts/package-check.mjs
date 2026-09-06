@@ -16,6 +16,9 @@
  *
  * S01: also asserts that the extension does not call the native
  * compaction entrypoint and does not write runtime telemetry.
+ * S02: also asserts the durable store does not modify any live Pi
+ * config, does not invoke a native compaction, and does not pull
+ * in any forbidden host-project dependency.
  */
 
 import { existsSync, readFileSync, statSync } from "node:fs";
@@ -133,6 +136,36 @@ if (existsSync(extPath)) {
 	}
 } else {
 	fail(`extension source missing: ${extPath}`);
+}
+
+// S02 side-effect gate: the store library must not touch live Pi
+// config or native compaction.
+const storePath = join(root, "src", "store");
+if (existsSync(storePath)) {
+	const { readdirSync } = await import("node:fs");
+	const storeFiles = readdirSync(storePath, { recursive: true }).filter(
+		(f) => typeof f === "string" && f.endsWith(".ts"),
+	);
+	for (const f of storeFiles) {
+		const t = readFileSync(join(storePath, f), "utf8");
+		if (/ctx\.compact\b|\.compact\(/.test(t)) {
+			fail(`store/${f} must not call ctx.compact() or .compact(...)`);
+		}
+	}
+	ok("store has zero native-compaction calls");
+}
+// The extension must NOT call into the store automatically. This
+// enforces the S02 "library, not lifecycle hook" contract.
+{
+	const extText = readFileSync(extPath, "utf8");
+	if (
+		/(from|require\()\s*["']\.\.\/store/.test(extText) ||
+		/(from|require\()\s*["']\.\.\/\.\.\/store/.test(extText)
+	) {
+		fail("extension must not import the durable store");
+	} else {
+		ok("extension does not import the durable store");
+	}
 }
 
 if (errors.length > 0) {

@@ -139,7 +139,10 @@ export function validateCheckpoint(input: unknown): Checkpoint {
 
 	requireHistoryRefs(c, "recovery_refs", "checkpoint");
 
-	requireString(c, "handoff_summary", "checkpoint");
+	// handoff_summary is an explicit, human-authored short summary.
+	// Per R02 §6 it MUST be present, but the field is permitted
+	// to be empty (e.g. for a checkpoint with no narrative value).
+	requireOptionalString(c, "handoff_summary", "checkpoint");
 
 	return c as unknown as Checkpoint;
 }
@@ -151,6 +154,19 @@ function requireString(
 ): void {
 	if (typeof o[key] !== "string" || (o[key] as string).length === 0) {
 		throw new Error(`validate${cap(owner)}: ${key} must be a non-empty string`);
+	}
+}
+
+function requireOptionalString(
+	o: Record<string, unknown>,
+	key: string,
+	owner: string,
+): void {
+	if (o[key] === undefined) {
+		throw new Error(`validate${cap(owner)}: ${key} must be present (may be empty)`);
+	}
+	if (typeof o[key] !== "string") {
+		throw new Error(`validate${cap(owner)}: ${key} must be a string`);
 	}
 }
 
