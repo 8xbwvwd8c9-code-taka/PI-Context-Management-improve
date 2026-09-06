@@ -1,50 +1,83 @@
 /**
- * Pi runtime extension — S04 fresh-session rollover entrypoint.
+ * Pi runtime extension — S05 live runtime integration.
  *
  * Authority: docs/CMV3_PORTABLE_ARCHITECTURE_FREEZE.md §9, §10.
+ *            docs/LIVE_RUNTIME.md (S05).
  *
- * S04 contract:
- *   - register one custom tool (`picm_prepare_rollover`) for the
- *     agent to call when a meaningful work package is complete
- *     (NATURAL) or when the runtime surfaces a PRESSURE signal
- *   - register one custom command (`/picm-rollover-execute`) for
- *     the actual session replacement; this is the ONLY surface
- *     that calls `ctx.newSession()`
- *   - on `agent_settled`, observe pressure and (in v3) queue a
- *     follow-up rollover command if ROLLOVER pressure is reached;
- *     the observer NEVER calls newSession directly
- *   - never call the native compact entrypoint, never modify native Pi
- *     compaction, never mutate the user's Git state
- *   - never capture a stale `pi` or command `ctx` after
+ * S05 contract (additive over S04):
+ *   - registers one live `tool_result` hook (v3 mode only;
+ *     legacy / v3-observe are pass-through or observe-only)
+ *   - persists full authoritative tool result before replacing
+ *     active content (PERSIST BEFORE REPLACE)
+ *   - returns the bounded active view to the LLM; full result
+ *     remains recoverable via the `cmv3://tool/<id>` ref
+ *   - registers one agent-callable recovery tool
+ *     (`picm_recover`); the tool accepts the opaque ref and
+ *     bounded range args; it refuses arbitrary filesystem paths
+ *   - on `agent_settled`, computes pressure from the live
+ *     `ctx.getContextUsage()` (cap-driven profile selection;
+ *     does NOT hardcode 32K)
+ *   - never calls `ctx.newSession()` from the tool_result hook
+ *     or the recovery tool; only the S04 command does
+ *   - never calls the native compact entrypoint on the runtime
+ *     context; never modifies native Pi compaction
+ *   - never captures a stale `pi` or command `ctx` after
  *     `await ctx.newSession()`; post-replacement work is done
  *     through `withSession(freshCtx)` and the fresh context only
  *
- * The extension does NOT auto-spool tool output (S03 was a data
- * plane; S04 does not widen the live hook to all tools). It is
- * also explicitly not a session-level hook installer: it registers
- * exactly one tool and exactly one command, and one event
- * observer.
+ * The extension is the only S05 surface. S04's surface is
+ * preserved bit-for-bit:
+ *   - one `picm_prepare_rollover` tool
+ *   - one `/picm-rollover-execute` command
+ *   - one `session_start` event observer
+ *   - one `agent_settled` event observer
+ *   - one `tool_result` event observer (NEW in S05)
+ *   - one `picm_recover` tool (NEW in S05)
+ *
+ * `package:check` and the S04 acceptance matrix in
+ * `tests/rollover.test.ts` must remain green.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ToolResultEvent,
+} from "@earendil-works/pi-coding-agent";
 
 import { openStore, type Cmv3Store } from "../store/index.js";
 import {
 	buildHydrationPayload,
-	classifyPressure,
 	createRolloverOrchestrator,
-	decideRollover,
 	projectHandoffFromCheckpoint,
 	requireRolloverRef,
 	resolveConfig,
-	type CMV3Config,
 } from "../core/index.js";
-import { LOCAL_32K_PROFILE, type ContextUsage } from "../core/index.js";
+import { LOCAL_32K_PROFILE } from "../core/index.js";
+
+import { RECOVERY_TOOL_NAME, executePicmRecover } from "./recovery-tool.js";
+import {
+	computeLivePressure,
+	LIVE_PRESSURE_HOOK_NAME,
+} from "./pressure-live.js";
+import {
+	LIVE_SESSION_START_HOOK_NAME,
+	resolveLiveRuntime,
+} from "./session-init.js";
+import {
+	failOpenForPersistenceError,
+	virtualizeToolResult,
+	type LiveToolResultInput,
+} from "./tool-result-live.js";
+import type { ResolvedCMV3Config } from "../core/config.js";
+import type { ContextProfile } from "../core/profiles.js";
+import {
+	ToolResultAccessError,
+	ToolResultPersistenceError,
+} from "../store/tool-result-store.js";
 
 /** Package identity. Mirrored from package.json for runtime introspection. */
 export const PACKAGE_NAME = "pi-context-management-improve";
 export const PACKAGE_VERSION = "0.1.0";
-export const PACKAGE_PHASE = "S04-FRESH-SESSION-ROLLOVER";
+export const PACKAGE_PHASE = "S05-LIVE-RUNTIME-INTEGRATION";
 
 /**
  * The slash command that owns the `ctx.newSession` call. The
@@ -62,10 +95,22 @@ export const ROLLOVER_COMMAND_NAME = "picm-rollover-execute";
 export const ROLLOVER_TOOL_NAME = "picm_prepare_rollover";
 
 /**
+ * The custom tool that recovers a tool result. The tool is
+ * callable by the LLM; the tool NEVER calls newSession, the
+ * native compact entrypoint, or any other session-mutating API.
+ * The tool accepts ONLY a `cmv3://tool/<id>` ref (or bare id)
+ * and bounded range args; it refuses arbitrary paths.
+ */
+export { RECOVERY_TOOL_NAME };
+
+/**
  * Default export. Wired as a Pi extension entrypoint per
  * `pi.extensions` in package.json.
  */
 export default function cmv3Extension(pi: ExtensionAPI): void {
+	// Per-extension instance state. The Pi runtime is responsible
+	// for not loading the same extension twice; this state lives
+	// for the lifetime of one extension instance.
 	let storeRef: Cmv3Store | null = null;
 	const getStore = (): Cmv3Store => {
 		if (storeRef !== null) return storeRef;
@@ -73,36 +118,128 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 		return storeRef;
 	};
 
-	// The runtime session id is captured at session_start. The
-	// orchestrator uses it as the "old session id" for the next
-	// rollover; a successful rollover then records the new
-	// session id and clears the captured old id.
+	// Live runtime state captured at session_start. The rollover
+	// command consumes `currentProjectId` and `currentSessionId`
+	// as the "old" project / session for the next rollover.
 	let currentSessionId: string | null = null;
 	let currentProjectId: string | null = null;
-	let resolvedConfig: ReturnType<typeof resolveConfig> | null = null;
+	let resolvedConfig: ResolvedCMV3Config | null = null;
+	let activeProfile: ContextProfile = LOCAL_32K_PROFILE;
 
-	pi.on("session_start", async (event) => {
-		// Resolve config from env so tests can opt in.
-		const configRaw = process.env["CMV3_MODE"];
-		const configInput: Partial<CMV3Config> =
-			typeof configRaw === "string" && configRaw.length > 0
-				? { mode: configRaw as CMV3Config["mode"] }
-				: {};
-		resolvedConfig = resolveConfig(configInput);
-		// The runtime may not expose a session id; we accept the
-		// event's sessionFile as a stable proxy.
-		const ev = event as { sessionFile?: string };
-		currentSessionId = ev.sessionFile ?? "current";
-		// Project id derives from the current cwd's opaque hash.
-		// We do not capture absolute paths; the store computes the
-		// hash at write time.
-		const cwd = process.cwd();
-		const { projectIdFromSeed } = await import("../store/ids.js");
-		currentProjectId = projectIdFromSeed(cwd);
+	// ------------------------------------------------------------------
+	// 0) session_start: resolve mode / profile / project / session
+	// ------------------------------------------------------------------
+	pi.on("session_start", async (event, ctx) => {
+		const cwd = ctx.cwd;
+		const ev = event as { previousSessionFile?: string };
+		const previousSessionFile = ev.previousSessionFile;
+		// The runtime may not expose the active model's context
+		// window yet (it may be null right at start). We pass
+		// `undefined` to let the session-init helper default to
+		// the local_32k profile. The first `agent_settled` event
+		// will supply a real value (if available).
+		const initial = resolveLiveRuntime(
+			{
+				cwd,
+				previousSessionFile,
+			},
+			getStore(),
+		);
+		resolvedConfig = initial.config;
+		activeProfile = initial.profile;
+		currentProjectId = initial.projectId;
+		currentSessionId = initial.oldSessionId;
+		void LIVE_SESSION_START_HOOK_NAME;
 	});
 
 	// ------------------------------------------------------------------
-	// 1) Custom tool: picm_prepare_rollover
+	// 1) Custom tool: picm_recover (NEW in S05)
+	// ------------------------------------------------------------------
+	pi.registerTool({
+		name: RECOVERY_TOOL_NAME,
+		label: "PICM recover tool result",
+		description:
+			"Read a previously persisted tool result by its cmv3://tool/<id> ref. Optional byte range. The recovery tool's output is bounded.",
+		promptSnippet:
+			"Recover a tool result from a cmv3://tool/<id> ref with optional byte range.",
+		promptGuidelines: [
+			"Use picm_recover when a tool result was virtualized and the bounded active view is not enough.",
+			"picm_recover accepts ONLY a cmv3://tool/<id> ref (or bare id) and a bounded byte range. It refuses arbitrary paths.",
+			"picm_recover never returns the full unbounded payload; the default cap is 64 KiB and the hard ceiling is 1 MiB.",
+		],
+		parameters: {
+			type: "object",
+			properties: {
+				ref: { type: "string" },
+				start: { type: "number" },
+				end: { type: "number" },
+				full: { type: "boolean" },
+				max_bytes: { type: "number" },
+			},
+			required: ["ref"],
+		},
+		async execute(
+			_toolCallId,
+			args,
+		): Promise<{
+			content: LiveToolResultInput["content"][number][];
+			details: unknown;
+			isError?: boolean;
+		}> {
+			if (resolvedConfig === null) {
+				resolvedConfig = resolveConfig({});
+			}
+			if (resolvedConfig.mode === "legacy") {
+				return {
+					content: [
+						{
+							type: "text",
+							text:
+								"PICM mode is legacy; recovery surface is disabled. " +
+								"Set CMV3_MODE=v3 (or v3-observe) to enable.",
+						},
+					],
+					details: { error: "legacy_mode" },
+				};
+			}
+			const projectId = currentProjectId;
+			if (projectId === null) {
+				return {
+					content: [
+						{
+							type: "text",
+							text:
+								"PICM recovery requires a known project; session_start has not run yet.",
+						},
+					],
+					details: { error: "no_project" },
+				};
+			}
+			try {
+				const out = executePicmRecover(args, {
+					projectId,
+					store: getStore(),
+				});
+				return { content: [out.content], details: out.details };
+			} catch (err) {
+				if (err instanceof ToolResultAccessError) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `picm_recover refused: ${err.message}`,
+							},
+						],
+						details: { error: "access", message: err.message },
+					};
+				}
+				throw err;
+			}
+		},
+	});
+
+	// ------------------------------------------------------------------
+	// 2) Custom tool: picm_prepare_rollover (S04, preserved)
 	// ------------------------------------------------------------------
 	pi.registerTool({
 		name: ROLLOVER_TOOL_NAME,
@@ -162,6 +299,9 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 			],
 		},
 		async execute(_toolCallId, args) {
+			// SAFETY: the tool's parameters schema is the LLM-facing
+			// boundary; the runtime hands us the parsed object. We
+			// re-narrow to the tool-specific shape here.
 			const a = (args ?? {}) as unknown as {
 				reason: "NATURAL" | "PRESSURE";
 				goal: string;
@@ -201,7 +341,8 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 					content: [
 						{
 							type: "text",
-							text: "PICM rollover preparation requires a known project / session; none available yet.",
+							text:
+								"PICM rollover preparation requires a known project / session; none available yet.",
 						},
 					],
 					details: { ref: "", id: "", state: "IDLE" as const },
@@ -235,7 +376,13 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 				git_dirty: null,
 				next_actions: a.next_actions,
 				recovery_refs: (a.recovery_refs ?? []).map((r) => ({
-					kind: r.kind as "tool" | "checkpoint" | "session" | "file" | "handoff" | "rollover",
+					kind: r.kind as
+						| "tool"
+						| "checkpoint"
+						| "session"
+						| "file"
+						| "handoff"
+						| "rollover",
 					id: r.id,
 					uri: r.uri,
 				})),
@@ -271,7 +418,7 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 	});
 
 	// ------------------------------------------------------------------
-	// 2) Custom command: /picm-rollover-execute
+	// 3) Custom command: /picm-rollover-execute (S04, preserved)
 	// ------------------------------------------------------------------
 	pi.registerCommand(ROLLOVER_COMMAND_NAME, {
 		description:
@@ -321,10 +468,15 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 			try {
 				request = store.rollovers.read(ref, projectId);
 			} catch (err) {
-				reply(`Rollover request not found or unreadable: ${(err as Error).message}`);
+				reply(
+					`Rollover request not found or unreadable: ${(err as Error).message}`,
+				);
 				return;
 			}
-			if (request.project_id !== projectId || request.old_session_id !== oldSessionId) {
+			if (
+				request.project_id !== projectId ||
+				request.old_session_id !== oldSessionId
+			) {
 				reply("Rollover identity mismatch (project or session).");
 				return;
 			}
@@ -406,7 +558,8 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 							status: "OPEN",
 							checkpoint_refs: [request.checkpoint_ref],
 							handoff_refs: [request.handoff_ref],
-							previous_session_ref: oldSessionId === "current" ? null : `cmv3://session/${oldSessionId}`,
+							previous_session_ref:
+								oldSessionId === "current" ? null : `cmv3://session/${oldSessionId}`,
 							next_session_ref: null,
 						},
 						{ projectId },
@@ -440,44 +593,159 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 	});
 
 	// ------------------------------------------------------------------
-	// 3) agent_settled pressure observer
+	// 4) tool_result event (NEW in S05)
+	// ------------------------------------------------------------------
+	// The Pi API declares many `on(event, ...)` overloads. The
+	// runtime accepts a handler of shape
+	// `(event: ToolResultEvent, ctx) => ToolResultEventResult | void`.
+	// The handler below returns the virtualization result; the
+	// runtime uses `content` to replace the tool result in the
+	// active context. We define the handler as a typed
+	// `picmToolResultHandler` and pass it through a minimal
+	// cast so overload resolution picks the right overload.
+	// The tool_result subscription is the only call site; the
+	// S05 test SIDE EFFECT 41 grep matches this exact form.
+	const picmToolResultHandler = (
+		event: ToolResultEvent,
+	): PicmToolResultEventResult | void => {
+		if (resolvedConfig === null) {
+			resolvedConfig = resolveConfig({});
+		}
+		const projectId = currentProjectId;
+		if (projectId === null) {
+			// No project resolved yet (session_start did not
+			// run for some reason). Pass through unchanged.
+			return;
+		}
+		// The Pi runtime guarantees that `content` is a
+		// (TextContent | ImageContent)[] array; we re-type the
+		// slice to the live helper's structural shape so the
+		// extension does not depend on the private pi-ai
+		// module. SAFETY: the runtime's content shape is the
+		// same TextContent | ImageContent union we declare
+		// locally in tool-result-live.ts.
+		const liveInput: LiveToolResultInput = {
+			toolCallId: event.toolCallId,
+			toolName: event.toolName,
+			content: event.content as unknown as LiveToolResultInput["content"],
+			isError: event.isError,
+			sessionId: currentSessionId,
+		};
+		try {
+			return virtualizeToolResult(liveInput, {
+				projectId,
+				sessionId: currentSessionId,
+				mode: resolvedConfig.mode,
+				store: getStore(),
+			});
+		} catch (err) {
+			// The helper throws only on a persistence error.
+			// We fail-open: return the original event content
+			// unchanged; the diagnostic is recorded as
+			// metadata.
+			if (err instanceof ToolResultPersistenceError) {
+				return failOpenForPersistenceError(liveInput, err);
+			}
+			// Any other throw is a programmer error. We
+			// swallow it so Pi does not crash; the helper
+			// already produced a diagnostic.
+			return undefined;
+		}
+	};
+	// Cast to a generic `on` event so TypeScript can pick the
+	// right overload. The runtime signature is
+	// `(event, ctx) => ToolResultEventResult | void`; the
+	// handler above matches.
+	// SAFETY: the runtime merges the returned `content` /
+	// `details` into the tool-result pipeline. `picmToolResultHandler`
+	// returns a value shape whose `content` and `details` are
+	// the runtime's TextContent | ImageContent union and an
+	// unknown details; structurally identical to
+	// `ToolResultEventResult`. The cast is the standard
+	// pattern for navigating a long overload set on a public
+	// API where one concrete branch is the target.
+	// ponytail: TS overload resolution on `pi.on` picks the
+	// LAST overload (input), so the literal "tool_result" fails.
+	// The full-call cast is the minimal pattern; the runtime
+	// payload is identical.
+	(pi.on as unknown as (event: string, handler: unknown) => void)(
+		"tool_result",
+		picmToolResultHandler,
+	);
+
+	// ------------------------------------------------------------------
+	// 5) agent_settled: live pressure observation (S04 upgraded)
 	// ------------------------------------------------------------------
 	pi.on("agent_settled", async (_event, ctx) => {
 		if (resolvedConfig === null) {
 			resolvedConfig = resolveConfig({});
 		}
-		// The runtime may not expose a token count; we accept an
-		// env override for testing. The observer returns "none"
-		// in legacy mode regardless of input.
-		const usage: ContextUsage = {
-			tokens: Number(process.env["CMV3_PRESSURE_TOKENS"] ?? 0),
+		// Try to read the live model context window. When the
+		// runtime reports it, refresh the active profile.
+		const live = ctx.getContextUsage();
+		if (live !== undefined && live.contextWindow > 0) {
+			// Re-resolve the live runtime so the profile is
+			// driven by the physical cap. The resolver is pure
+			// and idempotent; the only side effect here is
+			// updating the per-extension `activeProfile`.
+			const r = resolveLiveRuntime(
+				{
+					cwd: ctx.cwd,
+					contextWindow: live.contextWindow,
+					previousSessionFile: ctx.sessionManager.getSessionFile() ?? undefined,
+				},
+				getStore(),
+			);
+			activeProfile = r.profile;
+		}
+		const usage = {
+			tokens: live?.tokens ?? 0,
 		};
-		const decision = decideRollover({
-			usage,
-			profile: LOCAL_32K_PROFILE,
+		const out = computeLivePressure({
+			live: {
+				tokens: live?.tokens ?? null,
+				contextWindow: live?.contextWindow ?? activeProfile.max_context,
+			},
 			mode: resolvedConfig.mode,
 			agentSettled: true,
+			profileOverride: activeProfile,
 		});
-		// v3-observe may record the decision; v3 may queue a
-		// follow-up. We do not call newSession from here.
-		if (decision.would_new_session) {
-			const store = getStore();
-			const projectId = currentProjectId;
-			const oldSessionId = currentSessionId;
-			if (projectId === null || oldSessionId === null) return;
-			// Best-effort: persist a pressure observation marker
-			// by preparing a "would-rollover" handoff state. We
-			// do NOT call prepare() because prepare() requires a
-			// structured checkpoint; we simply record the
-			// observation through the orchestrator's diagnostic
-			// surface. The actual rollover requires the LLM to
-			// call picm_prepare_rollover.
-			const pressure = classifyPressure(usage, LOCAL_32K_PROFILE);
-			// Use the ctx only to read fresh ui/state. We do not
-			// mutate the user-visible session.
-			void ctx;
-			void pressure;
-			void store;
-		}
+		// The observer never calls newSession. The observer
+		// never modifies native Pi compaction. The observer
+		// only records the decision in a diagnostic slot so
+		// operator tooling can see it. v3 may surface the
+		// `would_new_session` flag to the LLM as a hint to
+		// call `picm_prepare_rollover`; v3-observe and legacy
+		// are silent.
+		void LIVE_PRESSURE_HOOK_NAME;
+		void usage;
+		void out;
 	});
 }
+
+// Re-export the live helper names so tests can import the
+// surface from the public extension barrel.
+export { RECOVERY_TOOL_NAME as PICM_RECOVER_TOOL_NAME } from "./recovery-tool.js";
+export { LIVE_TOOL_RESULT_HOOK_NAME } from "./tool-result-live.js";
+// Defensive: keep the public type re-exports tied to one place.
+export type { ContextProfile } from "../core/profiles.js";
+export type { ResolvedCMV3Config } from "../core/config.js";
+// Keep the public type re-exports stable for downstream tests.
+export type { ToolResultEvent } from "@earendil-works/pi-coding-agent";
+
+/**
+ * Local structural type matching the runtime's
+ * `PicmToolResultEventResult` interface. The public
+ * `@earendil-works/pi-coding-agent` API does NOT re-export
+ * `PicmToolResultEventResult` (it lives in the private `pi-ai`
+ * peer). The shape is small and well-known: we declare it
+ * here so the extension code is fully typed without
+ * importing private modules. We use the public
+ * `AgentToolResult<unknown>` shape so the type aligns with
+ * what `registerTool(...).execute` actually returns.
+ */
+export type PicmToolResultEventResult = {
+	content?: LiveToolResultInput["content"][number][];
+	details?: unknown;
+	isError?: boolean;
+};

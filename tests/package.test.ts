@@ -17,39 +17,37 @@ import {
 	DEFAULT_MODE,
 	CMV3_MODES,
 } from "../src/core/config.js";
-import { discoverGenericProject, GenericProjectAdapter } from "../src/adapters/generic.js";
+import {
+	discoverGenericProject,
+	GenericProjectAdapter,
+} from "../src/adapters/generic.js";
 import { discoverProject } from "../src/adapters/git.js";
-import { PACKAGE_NAME, PACKAGE_VERSION, PACKAGE_PHASE } from "../src/pi/extension.js";
+import {
+	PACKAGE_NAME,
+	PACKAGE_VERSION,
+	PACKAGE_PHASE,
+} from "../src/pi/extension.js";
 
 const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
 describe("package: exposes a Pi extension entry (test 1)", () => {
 	it("package.json declares pi.extensions", () => {
-		const pkg = JSON.parse(
-			readFileSync(join(REPO_ROOT, "package.json"), "utf8"),
-		);
+		const pkg = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8"));
 		assert.ok(pkg.pi, "package.json must declare a `pi` block");
 		assert.ok(Array.isArray(pkg.pi.extensions));
 		assert.ok(pkg.pi.extensions.length > 0);
 	});
 	it("the extension entry file exists", () => {
-		const pkg = JSON.parse(
-			readFileSync(join(REPO_ROOT, "package.json"), "utf8"),
-		);
+		const pkg = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8"));
 		const entry = pkg.pi.extensions[0].replace(/^\.\//, "");
 		const entryPath = join(REPO_ROOT, entry);
-		assert.ok(
-			existsSync(entryPath),
-			`extension entry must exist: ${entryPath}`,
-		);
+		assert.ok(existsSync(entryPath), `extension entry must exist: ${entryPath}`);
 	});
 });
 
 describe("package: exposes context-management Skill (test 2)", () => {
 	it("package.json declares pi.skills", () => {
-		const pkg = JSON.parse(
-			readFileSync(join(REPO_ROOT, "package.json"), "utf8"),
-		);
+		const pkg = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8"));
 		assert.ok(Array.isArray(pkg.pi.skills));
 		assert.ok(pkg.pi.skills.length > 0);
 	});
@@ -57,12 +55,7 @@ describe("package: exposes context-management Skill (test 2)", () => {
 
 describe("package: Skill path exists (test 3)", () => {
 	it("SKILL.md exists at the conventional path", () => {
-		const skillPath = join(
-			REPO_ROOT,
-			"skills",
-			"context-management",
-			"SKILL.md",
-		);
+		const skillPath = join(REPO_ROOT, "skills", "context-management", "SKILL.md");
 		assert.ok(existsSync(skillPath));
 		const text = readFileSync(skillPath, "utf8");
 		assert.match(text, /^---\nname: context-management/m);
@@ -83,9 +76,7 @@ describe("package: extension loads without side effects (test 4)", () => {
 			registerTool: () => {},
 			registerCommand: () => {},
 		};
-		assert.doesNotThrow(() =>
-			fn(stub as unknown as Parameters<typeof fn>[0]),
-		);
+		assert.doesNotThrow(() => fn(stub as unknown as Parameters<typeof fn>[0]));
 	});
 });
 
@@ -94,9 +85,9 @@ describe("package: metadata is valid (test 5)", () => {
 		assert.equal(PACKAGE_NAME, "pi-context-management-improve");
 		assert.equal(typeof PACKAGE_VERSION, "string");
 		assert.equal(PACKAGE_VERSION.length > 0, true);
-		// S04 owns the live extension. The phase tag reflects the
+		// S05 owns the live extension. The phase tag reflects the
 		// current capability surface.
-		assert.equal(PACKAGE_PHASE, "S04-FRESH-SESSION-ROLLOVER");
+		assert.equal(PACKAGE_PHASE, "S05-LIVE-RUNTIME-INTEGRATION");
 	});
 });
 
@@ -126,9 +117,7 @@ describe("config: invalid mode rejected (test 32)", () => {
 		// The static type already rejects unknown modes; the runtime
 		// test casts to bypass the type system and verifies that the
 		// resolver still raises on an unknown string at the boundary.
-		assert.throws(() =>
-			resolveConfig({ mode: "v9" as unknown as "legacy" }),
-		);
+		assert.throws(() => resolveConfig({ mode: "v9" as unknown as "legacy" }));
 	});
 });
 
@@ -186,9 +175,7 @@ describe("portability: importing portable core does not require a Git repo (test
 
 describe("portability: zero ST_BOT dependencies (test 35)", () => {
 	it("production source contains no ST_BOT coupling", () => {
-		const pkg = JSON.parse(
-			readFileSync(join(REPO_ROOT, "package.json"), "utf8"),
-		);
+		const pkg = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8"));
 		const raw = JSON.stringify(pkg);
 		// Allow the historical mention in the description; it is
 		// documentation context, not a dependency.
@@ -231,7 +218,11 @@ describe("side-effect gate (portable contract)", () => {
 		// comment that mentions the forbidden function is allowed
 		// (and useful for documentation). We scan for the call
 		// form: `ctx.compact(` or `.compact(`.
-		assert.equal(/ctx\.compact\(/.test(text), false, "must not call ctx.compact()");
+		assert.equal(
+			/ctx\.compact\(/.test(text),
+			false,
+			"must not call ctx.compact()",
+		);
 		assert.equal(/\.compact\(/.test(text), false, "must not call .compact(...)");
 	});
 	it("the package does not write runtime telemetry in portable code", () => {
@@ -241,9 +232,21 @@ describe("side-effect gate (portable contract)", () => {
 		);
 		// Ban writeFile / appendFile call sites. Comments that
 		// mention the names are allowed.
-		assert.equal(/writeFile(?:Sync)?\s*\(/.test(text), false, "must not call writeFile*");
-		assert.equal(/appendFile(?:Sync)?\s*\(/.test(text), false, "must not call appendFile*");
-		assert.equal(/appendEntry\s*\(/.test(text), false, "must not call appendEntry()");
+		assert.equal(
+			/writeFile(?:Sync)?\s*\(/.test(text),
+			false,
+			"must not call writeFile*",
+		);
+		assert.equal(
+			/appendFile(?:Sync)?\s*\(/.test(text),
+			false,
+			"must not call appendFile*",
+		);
+		assert.equal(
+			/appendEntry\s*\(/.test(text),
+			false,
+			"must not call appendEntry()",
+		);
 	});
 	it("no live Pi config is modified", () => {
 		const text = readFileSync(
