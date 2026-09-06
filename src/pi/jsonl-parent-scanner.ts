@@ -7,8 +7,8 @@
  * Scans the Pi session directory for JSONL files whose
  * `parentSession` field equals the supplied `oldSessionId`.
  *
- * Pi's session directory layout is `~/.pi/agent/sessions/*.jsonl`
- * (or the equivalent on the host); the field name is
+ * Pi's session directory layout nests per-project directories beneath
+ * `~/.pi/agent/sessions` (or the equivalent on the host); the field name is
  * `parentSession`. Each JSONL is an append-only log of one Pi
  * session; the first line carries the session header (which
  * contains `parentSession` when the session was forked or
@@ -17,21 +17,36 @@
  * The scanner is intentionally cheap: it reads ONLY the first
  * line of each JSONL. It does NOT load the full conversation.
  *
- * The scanner NEVER throws: a corrupt or unreadable JSONL is
- * skipped silently so the reconciliation's outer try/catch
- * stays clean and EXECUTING rollovers are preserved.
+ * The scanner reports corrupt, unreadable, oversized, or partially traversed
+ * evidence as `incomplete`, so reconciliation preserves EXECUTING.
  *
- * The scanner is NOT used by tests; tests inject a stub via
+ * Tests use both this implementation with injected reads and stubs through
  * the `JsonlParentScanner` interface in `./reconcile.ts`.
  */
 
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { closeSync, lstatSync, openSync, readSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
 import type { JsonlParentScanner } from "./reconcile.js";
 
 const DEFAULT_PI_SESSIONS_DIR = join(homedir(), ".pi", "agent", "sessions");
+export const DEFAULT_MAX_JSONL_HEADER_BYTES = 64 * 1024;
+const DEFAULT_MAX_SCAN_ENTRIES = 10_000;
+
+interface ScannerDirEntry {
+	readonly name: string;
+	isDirectory(): boolean;
+	isFile(): boolean;
+	isSymbolicLink(): boolean;
+}
+
+export interface JsonlScannerOptions {
+	readonly maxHeaderBytes?: number;
+	readonly maxEntries?: number;
+	readonly readdir?: (path: string) => readonly ScannerDirEntry[];
+	readonly read?: typeof readSync;
+}
 
 /**
  * Create a filesystem-backed scanner rooted at `sessionsDir`.
@@ -40,46 +55,105 @@ const DEFAULT_PI_SESSIONS_DIR = join(homedir(), ".pi", "agent", "sessions");
  */
 export function createFsJsonlParentScanner(
 	sessionsDir: string = DEFAULT_PI_SESSIONS_DIR,
+	options: JsonlScannerOptions = {},
 ): JsonlParentScanner {
+	const readdir = options.readdir ?? ((path: string) => readdirSync(path, { withFileTypes: true }));
+	const read = options.read ?? readSync;
+	const maxHeaderBytes = options.maxHeaderBytes ?? DEFAULT_MAX_JSONL_HEADER_BYTES;
+	const maxEntries = options.maxEntries ?? DEFAULT_MAX_SCAN_ENTRIES;
 	return {
-		findChildren(oldSessionId: string): readonly string[] {
-			if (oldSessionId.length === 0) return [];
-			if (!existsSync(sessionsDir)) return [];
-			const matches: string[] = [];
-			let entries: string[];
+		findChildren(oldSessionId: string) {
+			if (oldSessionId.length === 0) {
+				return { kind: "complete" as const, children: [] };
+			}
 			try {
-				entries = readdirSync(sessionsDir);
-			} catch {
-				return [];
+				const root = lstatSync(sessionsDir);
+				if (root.isSymbolicLink() || !root.isDirectory()) {
+					return incomplete(`sessions root is not a real directory: ${sessionsDir}`);
+				}
+			} catch (error) {
+				if (isMissing(error)) return { kind: "complete" as const, children: [] };
+				return incomplete(`cannot inspect sessions root ${sessionsDir}: ${errorMessage(error)}`);
 			}
-			for (const entry of entries) {
-				if (!entry.endsWith(".jsonl")) continue;
-				const path = join(sessionsDir, entry);
-				let firstLine: string;
+			const matches = new Set<string>();
+			const pending = [sessionsDir];
+			let visited = 0;
+			while (pending.length > 0) {
+				const directory = pending.shift()!;
+				let entries: readonly ScannerDirEntry[];
 				try {
-					const raw = readFileSync(path, "utf8");
-					const idx = raw.indexOf("\n");
-					firstLine = idx === -1 ? raw : raw.slice(0, idx);
-				} catch {
-					continue;
+					entries = [...readdir(directory)].sort((a, b) => a.name.localeCompare(b.name));
+				} catch (error) {
+					return incomplete(`cannot read ${directory}: ${errorMessage(error)}`);
 				}
-				let header: unknown;
-				try {
-					header = JSON.parse(firstLine);
-				} catch {
-					continue;
-				}
-				if (
-					typeof header === "object" &&
-					header !== null &&
-					(header as { parentSession?: unknown }).parentSession === oldSessionId
-				) {
-					// The new session id is the file basename
-					// without the .jsonl extension.
-					matches.push(entry.replace(/\.jsonl$/, ""));
+				for (const entry of entries) {
+					visited += 1;
+					if (visited > maxEntries) return incomplete(`scan exceeds ${maxEntries} entries`);
+					if (entry.isSymbolicLink()) return incomplete(`symlink encountered during scan: ${join(directory, entry.name)}`);
+					const path = join(directory, entry.name);
+					if (entry.isDirectory()) {
+						pending.push(path);
+						continue;
+					}
+					if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+					const headerResult = readHeader(path, maxHeaderBytes, read);
+					if (headerResult.kind === "incomplete") return headerResult;
+					let header: unknown;
+					try {
+						header = JSON.parse(headerResult.header);
+					} catch (error) {
+						return incomplete(`invalid JSONL header in ${path}: ${errorMessage(error)}`);
+					}
+					if (typeof header === "object" && header !== null &&
+						(header as { parentSession?: unknown }).parentSession === oldSessionId) {
+						matches.add(entry.name.replace(/\.jsonl$/, ""));
+					}
 				}
 			}
-			return matches;
+			return { kind: "complete" as const, children: [...matches].sort() };
 		},
 	};
+}
+
+function readHeader(path: string, maxBytes: number, read: typeof readSync):
+	| { kind: "complete"; header: string }
+	| { kind: "incomplete"; detail: string } {
+	let fd: number | undefined;
+	let result: { kind: "complete"; header: string } | { kind: "incomplete"; detail: string };
+	try {
+		fd = openSync(path, "r");
+		const buffer = Buffer.alloc(maxBytes + 1);
+		const count = read(fd, buffer, 0, buffer.length, 0);
+		const newline = buffer.subarray(0, count).indexOf(0x0a);
+		if (newline === -1 && count > maxBytes) {
+			result = incomplete(`JSONL header exceeds ${maxBytes} bytes in ${path}`);
+		} else {
+			const end = newline === -1 ? count : newline;
+			result = { kind: "complete", header: buffer.toString("utf8", 0, end) };
+		}
+	} catch (error) {
+		result = incomplete(`cannot read ${path}: ${errorMessage(error)}`);
+	} finally {
+		if (fd !== undefined) {
+			try {
+				closeSync(fd);
+			} catch (error) {
+				result = incomplete(`cannot close ${path}: ${errorMessage(error)}`);
+			}
+		}
+	}
+	return result!;
+}
+
+function incomplete(detail: string): { kind: "incomplete"; detail: string } {
+	return { kind: "incomplete", detail: detail.slice(0, 400) };
+}
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function isMissing(error: unknown): boolean {
+	return typeof error === "object" && error !== null &&
+		"code" in error && (error as { code?: unknown }).code === "ENOENT";
 }

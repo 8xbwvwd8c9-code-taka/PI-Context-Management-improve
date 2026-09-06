@@ -29,10 +29,9 @@
  *   - On ANY exception the rollover is left EXECUTING and a
  *     bounded diagnostic is emitted; no sleeps, no retries, no
  *     timeouts.
- *   - SessionStore.list returns summaries without
- *     `previous_session_ref`; this module reads each summary via
- *     `readById` to inspect the field. The public SessionStore
- *     contract is NOT expanded.
+ *   - Reconciliation enumerates authoritative session records and reads each
+ *     through `readById`, keeping ordinary SessionStore.list semantics intact
+ *     while preventing unreadable evidence from becoming a false zero.
  *   - The Pi JSONL scan is delegated to an injectable
  *     `JsonlParentScanner` so tests can drive the B branch
  *     deterministically. A thin filesystem-backed default is
@@ -44,6 +43,8 @@
  * method allows (EXECUTING -> COMPLETE, EXECUTING -> FAILED).
  * No new state is added.
  */
+import { readdirSync } from "node:fs";
+import { join } from "node:path";
 import { SESSION_REF_KIND } from "../store/session-store.js";
 /* -------------------------------------------------------------------- *
  * Public entry point                                                    *
@@ -77,32 +78,41 @@ export function reconcileInterruptedRollovers(input) {
                 now,
             });
             actions.push(action);
-            if (action.kind === "ambiguous") {
+            if (action.kind === "incomplete") {
+                const diag = {
+                    level: "error",
+                    message: `P04 reconciliation: incomplete ${action.source} evidence for rollover ${action.rolloverId} ` +
+                        `(${action.detail}); rollover left EXECUTING.`,
+                    rolloverId: action.rolloverId,
+                };
+                diagnostics.push(diag);
+                sink.emit(diag);
+            }
+            else if (action.kind === "ambiguous") {
                 const diag = {
                     level: "warning",
-                    message:
-                        `P04 reconciliation: ambiguous candidates for rollover ${action.rolloverId} ` +
+                    message: `P04 reconciliation: ambiguous candidates for rollover ${action.rolloverId} ` +
                         `(source=${action.source}, count=${action.candidateCount}); ` +
                         `rollover left EXECUTING.`,
                     rolloverId: action.rolloverId,
                 };
                 diagnostics.push(diag);
                 sink.emit(diag);
-            } else if (action.kind === "fail") {
+            }
+            else if (action.kind === "fail") {
                 const diag = {
                     level: "info",
-                    message:
-                        `P04 reconciliation: rollover ${action.rolloverId} marked FAILED ` +
+                    message: `P04 reconciliation: rollover ${action.rolloverId} marked FAILED ` +
                         `(${action.failure_code}; ${action.failure_detail}).`,
                     rolloverId: action.rolloverId,
                 };
                 diagnostics.push(diag);
                 sink.emit(diag);
-            } else if (action.kind === "complete") {
+            }
+            else if (action.kind === "complete") {
                 const diag = {
                     level: "info",
-                    message:
-                        `P04 reconciliation: rollover ${action.rolloverId} marked COMPLETE ` +
+                    message: `P04 reconciliation: rollover ${action.rolloverId} marked COMPLETE ` +
                         `(new_session_id=${action.newSessionId}).`,
                     rolloverId: action.rolloverId,
                 };
@@ -110,14 +120,14 @@ export function reconcileInterruptedRollovers(input) {
                 sink.emit(diag);
             }
         }
-    } catch (err) {
+    }
+    catch (err) {
         // Per WP: catch, preserve EXECUTING, emit bounded
         // diagnostic. NO retry, NO sleeps, NO timeouts.
         const message = err instanceof Error ? err.message : String(err);
         const diag = {
             level: "error",
-            message:
-                `P04 reconciliation: exception during scan: ${message}. ` +
+            message: `P04 reconciliation: exception during scan: ${message}. ` +
                 `EXECUTING rollovers preserved; no terminal transition.`,
         };
         diagnostics.push(diag);
@@ -164,7 +174,8 @@ function reconcileOne(rollover, ctx) {
                 failure_detail: `rollover old_session_id ${rolloverOld} does not match live ${liveOld}`,
                 rolloverId: rollover.rollover_request_id,
             };
-        } catch {
+        }
+        catch {
             return {
                 kind: "noop",
                 rolloverId: rollover.rollover_request_id,
@@ -184,19 +195,20 @@ function reconcileOne(rollover, ctx) {
     try {
         durableLookup = findDurableChild(ctx.store.sessions, {
             projectId: ctx.projectId,
+            layout: ctx.store.layout,
             oldSessionRef: liveRef,
+            checkpointRef: rollover.checkpoint_ref,
+            handoffRef: rollover.handoff_ref,
         });
-    } catch {
-        // The B branch is the fallback. Errors on the A
-        // branch are NOT catastrophic — we still have the
-        // JSONL scanner as the backstop. We log and fall
-        // through to the B branch by treating the A branch
-        // as "zero candidates found". The error is
-        // captured into a NOOP action so the caller can
-        // surface it.
+    }
+    catch (error) {
+        // Incomplete durable evidence cannot authorize a terminal
+        // transition, even if the JSONL source remains readable.
         return {
-            kind: "noop",
+            kind: "incomplete",
             rolloverId: rollover.rollover_request_id,
+            detail: `durable scan failed: ${boundedError(error)}`,
+            source: "durable",
         };
     }
     if (durableLookup.kind === "ambiguous") {
@@ -204,6 +216,14 @@ function reconcileOne(rollover, ctx) {
             kind: "ambiguous",
             rolloverId: rollover.rollover_request_id,
             candidateCount: durableLookup.count,
+            source: "durable",
+        };
+    }
+    if (durableLookup.kind === "incomplete") {
+        return {
+            kind: "incomplete",
+            rolloverId: rollover.rollover_request_id,
+            detail: durableLookup.detail,
             source: "durable",
         };
     }
@@ -226,7 +246,8 @@ function reconcileOne(rollover, ctx) {
                 newSessionId: updated.new_session_id ?? durableLookup.childId,
                 rolloverId: rollover.rollover_request_id,
             };
-        } catch {
+        }
+        catch {
             // Transition failure (state machine rejected
             // the move). Preserve EXECUTING.
             return {
@@ -238,12 +259,23 @@ function reconcileOne(rollover, ctx) {
     // B. Pi JSONL parentSession scan.
     let jsonlLookup;
     try {
-        const jsonlChildren = ctx.jsonlScanner.findChildren(ctx.oldSessionId);
-        jsonlLookup = classifyChildren(jsonlChildren);
-    } catch {
+        const scan = ctx.jsonlScanner.findChildren(ctx.oldSessionId);
+        if (scan.kind === "incomplete") {
+            return {
+                kind: "incomplete",
+                rolloverId: rollover.rollover_request_id,
+                detail: scan.detail,
+                source: "jsonl",
+            };
+        }
+        jsonlLookup = classifyChildren(scan.children);
+    }
+    catch (error) {
         return {
-            kind: "noop",
+            kind: "incomplete",
             rolloverId: rollover.rollover_request_id,
+            detail: `JSONL scan failed: ${boundedError(error)}`,
+            source: "jsonl",
         };
     }
     if (jsonlLookup.kind === "ambiguous") {
@@ -261,18 +293,17 @@ function reconcileOne(rollover, ctx) {
                 ref: ctx.store.rollovers.refFor(rollover.rollover_request_id),
                 to: "FAILED",
                 failureCode: "new_session_failed",
-                failureDetail:
-                    "ghost child exists but S04 durable session linkage never completed",
+                failureDetail: "ghost child exists but S04 durable session linkage never completed",
                 now: ctx.now(),
             });
             return {
                 kind: "fail",
                 failure_code: "new_session_failed",
-                failure_detail:
-                    "ghost child exists but S04 durable session linkage never completed",
+                failure_detail: "ghost child exists but S04 durable session linkage never completed",
                 rolloverId: rollover.rollover_request_id,
             };
-        } catch {
+        }
+        catch {
             return {
                 kind: "noop",
                 rolloverId: rollover.rollover_request_id,
@@ -292,18 +323,17 @@ function reconcileOne(rollover, ctx) {
             ref: ctx.store.rollovers.refFor(rollover.rollover_request_id),
             to: "FAILED",
             failureCode: "new_session_failed",
-            failureDetail:
-                "no child evidence at startup; rollover interrupted before side effect",
+            failureDetail: "no child evidence at startup; rollover interrupted before side effect",
             now: ctx.now(),
         });
         return {
             kind: "fail",
             failure_code: "new_session_failed",
-            failure_detail:
-                "no child evidence at startup; rollover interrupted before side effect",
+            failure_detail: "no child evidence at startup; rollover interrupted before side effect",
             rolloverId: rollover.rollover_request_id,
         };
-    } catch {
+    }
+    catch {
         return {
             kind: "noop",
             rolloverId: rollover.rollover_request_id,
@@ -313,30 +343,46 @@ function reconcileOne(rollover, ctx) {
 /**
  * Find durable PICM child session records whose
  * `previous_session_ref` equals `oldSessionRef`. The SessionStore
- * public surface is preserved: `list` returns summaries (no
- * `previous_session_ref`); we re-open each summary via
- * `readById` to inspect the field.
+ * public surface is preserved. P04 scans the authoritative record directory
+ * directly, then uses `readById` for integrity validation.
  */
 export function findDurableChild(sessions, input) {
-    const summaries = sessions.list(input.projectId);
+    const directory = join(input.layout.projectsRoot, input.projectId, "sessions");
+    let ids;
+    try {
+        ids = readdirSync(directory, { withFileTypes: true })
+            .filter((entry) => entry.isFile() && !entry.isSymbolicLink() && entry.name.endsWith(".json"))
+            .map((entry) => entry.name.slice(0, -".json".length))
+            .sort();
+    }
+    catch (error) {
+        if (isMissingError(error))
+            return { kind: "zero" };
+        return { kind: "incomplete", detail: `cannot enumerate durable sessions: ${boundedError(error)}` };
+    }
     const matches = [];
-    for (const summary of summaries) {
+    for (const id of ids) {
         let record;
         try {
-            record = sessions.readById(input.projectId, summary.id);
-        } catch {
-            // Unreadable record; skip and continue.
-            continue;
+            record = sessions.readById(input.projectId, id);
         }
-        if (
-            typeof record.previous_session_ref === "string" &&
-            record.previous_session_ref === input.oldSessionRef
-        ) {
-            matches.push(record.session_id || summary.id);
+        catch (error) {
+            return {
+                kind: "incomplete",
+                detail: `cannot inspect durable session ${id}: ${boundedError(error)}`,
+            };
+        }
+        if (typeof record.previous_session_ref === "string" &&
+            record.previous_session_ref === input.oldSessionRef &&
+            record.checkpoint_refs.includes(input.checkpointRef) &&
+            record.handoff_refs.includes(input.handoffRef)) {
+            matches.push(record.session_id || id);
         }
     }
-    if (matches.length === 0) return { kind: "zero" };
-    if (matches.length === 1) return { kind: "one", childId: matches[0] };
+    if (matches.length === 0)
+        return { kind: "zero" };
+    if (matches.length === 1)
+        return { kind: "one", childId: matches[0] };
     return { kind: "ambiguous", count: matches.length };
 }
 /* -------------------------------------------------------------------- *
@@ -350,7 +396,8 @@ function listExecutingRollovers(store, projectId) {
     for (const summary of summaries) {
         try {
             out.push(store.rollovers.read(summary.ref, projectId));
-        } catch (err) {
+        }
+        catch (err) {
             // Skip unreadable rollover records; partial
             // corruption must not throw the reconciliation
             // loop. The outer try/catch in
@@ -364,9 +411,19 @@ function listExecutingRollovers(store, projectId) {
     return out;
 }
 function classifyChildren(children) {
-    if (children.length === 0) return { kind: "zero" };
-    if (children.length === 1) return { kind: "one", childId: children[0] };
+    if (children.length === 0)
+        return { kind: "zero" };
+    if (children.length === 1)
+        return { kind: "one", childId: children[0] };
     return { kind: "ambiguous", count: children.length };
+}
+function boundedError(error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return message.slice(0, 300);
+}
+function isMissingError(error) {
+    return typeof error === "object" && error !== null && "code" in error &&
+        error.code === "ENOENT";
 }
 /**
  * Normalize a Pi session file path to the opaque id used in
@@ -382,10 +439,12 @@ function classifyChildren(children) {
  *     durable-lookup branch never matches them).
  */
 export function normalizeSessionId(raw) {
-    if (typeof raw !== "string" || raw.length === 0) return "";
+    if (typeof raw !== "string" || raw.length === 0)
+        return "";
     const base = raw.split("/").pop() ?? "";
     const stripped = base.replace(/\.json$/, "");
-    if (stripped.length === 0 || stripped === "current") return "";
+    if (stripped.length === 0 || stripped === "current")
+        return "";
     return stripped;
 }
 /**
@@ -397,7 +456,8 @@ export function normalizeSessionId(raw) {
  */
 export function previousSessionRefFor(raw) {
     const id = normalizeSessionId(raw);
-    if (id.length === 0) return null;
+    if (id.length === 0)
+        return null;
     return `cmv3://${SESSION_REF_KIND}/${id}`;
 }
 /* -------------------------------------------------------------------- *

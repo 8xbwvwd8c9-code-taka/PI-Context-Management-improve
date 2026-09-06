@@ -46,6 +46,7 @@ import { generateId } from "../src/store/ids.js";
 import type { Checkpoint } from "../src/core/checkpoint.js";
 import type {
 	JsonlParentScanner,
+	JsonlScanResult,
 	ReconcileDiagnostic,
 	ReconcileOutcome,
 } from "../src/pi/reconcile.js";
@@ -124,7 +125,16 @@ function capturingSink(): CapturingSink & {
 
 function stubJsonlScanner(children: readonly string[]): JsonlParentScanner {
 	return {
-		findChildren: (_oldSessionId: string): readonly string[] => children,
+		findChildren: (_oldSessionId: string): JsonlScanResult => ({
+			kind: "complete",
+			children,
+		}),
+	};
+}
+
+function incompleteJsonlScanner(detail = "synthetic scan failure"): JsonlParentScanner {
+	return {
+		findChildren: (): JsonlScanResult => ({ kind: "incomplete", detail }),
 	};
 }
 
@@ -172,7 +182,13 @@ function addDurableChild(input: {
 	projectId: string;
 	newSessionId: string;
 	previousSessionRef: string;
+	checkpointRefs?: readonly string[];
+	handoffRefs?: readonly string[];
 }): void {
+	const executing = input.store.rollovers.list(input.projectId, { state: "EXECUTING" });
+	const request = executing.length === 1
+		? input.store.rollovers.read(executing[0].ref, input.projectId)
+		: null;
 	input.store.sessions.write(
 		{
 			schema_version: "1.0.0",
@@ -180,8 +196,8 @@ function addDurableChild(input: {
 			project_id: input.projectId,
 			started_at: new Date().toISOString(),
 			status: "OPEN",
-			checkpoint_refs: [],
-			handoff_refs: [],
+			checkpoint_refs: [...(input.checkpointRefs ?? (request ? [request.checkpoint_ref] : []))],
+			handoff_refs: [...(input.handoffRefs ?? (request ? [request.handoff_ref] : []))],
 			previous_session_ref: input.previousSessionRef,
 			next_session_ref: null,
 		},
@@ -189,11 +205,65 @@ function addDurableChild(input: {
 	);
 }
 
+describe("T-P04-R1: durable children are rollover-specific", () => {
+	it("two rollovers sharing one parent cannot complete against the same child", async () => {
+		const { store } = freshStore();
+		const projectId = freshProjectId("r1");
+		const oldSessionId = "/tmp/p04-r1-old.json";
+		const idA = await driveExecutingRollover({ store, projectId, oldSessionId, workPackage: "WP-R1-A" });
+		const idB = await driveExecutingRollover({ store, projectId, oldSessionId, workPackage: "WP-R1-B" });
+		const requestA = store.rollovers.read(`cmv3://rollover/${idA}`, projectId);
+		addDurableChild({
+			store,
+			projectId,
+			newSessionId: "sess_p04_r1_child_a",
+			previousSessionRef: makeRef("session", "p04-r1-old"),
+			checkpointRefs: [requestA.checkpoint_ref],
+			handoffRefs: [requestA.handoff_ref],
+		});
+
+		reconcileInterruptedRollovers({
+			projectId,
+			oldSessionId,
+			store,
+			jsonlScanner: stubJsonlScanner([]),
+			sink: capturingSink(),
+		});
+
+		const afterA = store.rollovers.read(`cmv3://rollover/${idA}`, projectId);
+		const afterB = store.rollovers.read(`cmv3://rollover/${idB}`, projectId);
+		assert.equal(afterA.state, "COMPLETE");
+		assert.equal(afterA.new_session_id, "sess_p04_r1_child_a");
+		assert.notEqual(afterB.state, "COMPLETE");
+		assert.notEqual(afterB.new_session_id, "sess_p04_r1_child_a");
+	});
+});
+
+describe("T-P04-R2/R6: incomplete JSONL evidence preserves EXECUTING", () => {
+	it("does not turn an incomplete scan into zero evidence", async () => {
+		const { store } = freshStore();
+		const projectId = freshProjectId("r2");
+		const oldSessionId = "/tmp/p04-r2-old.json";
+		const id = await driveExecutingRollover({ store, projectId, oldSessionId, workPackage: "WP-R2" });
+		const sink = capturingSink();
+		const out = reconcileInterruptedRollovers({
+			projectId,
+			oldSessionId,
+			store,
+			jsonlScanner: incompleteJsonlScanner("sessions directory unreadable"),
+			sink,
+		});
+		assert.equal(out.actions[0].kind, "incomplete");
+		assert.equal(store.rollovers.read(`cmv3://rollover/${id}`, projectId).state, "EXECUTING");
+		assert.match(sink.diagnostics[0]?.message ?? "", /incomplete|unreadable/i);
+	});
+});
+
 /* -------------------------------------------------------------------- *
  * T-P04-01: startup + exactly one durable child -> COMPLETE              *
  * -------------------------------------------------------------------- */
 
-describe("T-P04-01: startup + exactly one durable child transitions the rollover to COMPLETE", () => {
+describe("T-P04-01 / T-P04-R7: one exact durable child transitions the rollover to COMPLETE", () => {
 	before(() => {
 		process.env["CMV3_MODE"] = "v3";
 	});
@@ -254,7 +324,7 @@ describe("T-P04-01: startup + exactly one durable child transitions the rollover
  * T-P04-02: startup + exactly one ghost JSONL -> FAILED(new_session)    *
  * -------------------------------------------------------------------- */
 
-describe("T-P04-02: startup + exactly one ghost JSONL child transitions the rollover to FAILED(new_session_failed)", () => {
+describe("T-P04-02 / T-P04-R8: one ghost after a complete scan transitions to FAILED(new_session_failed)", () => {
 	before(() => {
 		process.env["CMV3_MODE"] = "v3";
 	});
@@ -889,7 +959,7 @@ describe("T-P04-10: a thrown scanner exception leaves EXECUTING rollovers untouc
 		// branch will swallow the exception; the rollover
 		// stays EXECUTING.
 		const wrapperScanner: JsonlParentScanner = {
-			findChildren: (_oldSessionId: string): readonly string[] => {
+			findChildren: (_oldSessionId: string): JsonlScanResult => {
 				throw new Error("simulated JSONL scan failure");
 			},
 		};
@@ -900,7 +970,8 @@ describe("T-P04-10: a thrown scanner exception leaves EXECUTING rollovers untouc
 			jsonlScanner: wrapperScanner,
 			sink,
 		});
-		assert.equal(out.actions[0].kind, "noop");
+		assert.equal(out.actions[0].kind, "incomplete");
+		assert.match(sink.diagnostics[0]?.message ?? "", /simulated JSONL scan failure/);
 		const after = store.rollovers.read(`cmv3://rollover/${id}`, projectId);
 		assert.equal(after.state, "EXECUTING");
 	});

@@ -7,8 +7,8 @@
  * Scans the Pi session directory for JSONL files whose
  * `parentSession` field equals the supplied `oldSessionId`.
  *
- * Pi's session directory layout is `~/.pi/agent/sessions/*.jsonl`
- * (or the equivalent on the host); the field name is
+ * Pi's session directory layout nests per-project directories beneath
+ * `~/.pi/agent/sessions` (or the equivalent on the host); the field name is
  * `parentSession`. Each JSONL is an append-only log of one Pi
  * session; the first line carries the session header (which
  * contains `parentSession` when the session was forked or
@@ -17,20 +17,32 @@
  * The scanner is intentionally cheap: it reads ONLY the first
  * line of each JSONL. It does NOT load the full conversation.
  *
- * The scanner NEVER throws: a corrupt or unreadable JSONL is
- * skipped silently so the reconciliation's outer try/catch
- * stays clean and EXECUTING rollovers are preserved.
+ * The scanner reports corrupt, unreadable, oversized, or partially traversed
+ * evidence as `incomplete`, so reconciliation preserves EXECUTING.
  *
- * The scanner is NOT used by tests; tests inject a stub via
+ * Tests use both this implementation with injected reads and stubs through
  * the `JsonlParentScanner` interface in `./reconcile.ts`.
  */
+import { readSync } from "node:fs";
 import type { JsonlParentScanner } from "./reconcile.js";
+export declare const DEFAULT_MAX_JSONL_HEADER_BYTES: number;
+interface ScannerDirEntry {
+    readonly name: string;
+    isDirectory(): boolean;
+    isFile(): boolean;
+    isSymbolicLink(): boolean;
+}
+export interface JsonlScannerOptions {
+    readonly maxHeaderBytes?: number;
+    readonly maxEntries?: number;
+    readonly readdir?: (path: string) => readonly ScannerDirEntry[];
+    readonly read?: typeof readSync;
+}
 /**
  * Create a filesystem-backed scanner rooted at `sessionsDir`.
  * Defaults to `~/.pi/agent/sessions` (the canonical Pi runtime
  * location).
  */
-export declare function createFsJsonlParentScanner(
- sessionsDir?: string,
-): JsonlParentScanner;
+export declare function createFsJsonlParentScanner(sessionsDir?: string, options?: JsonlScannerOptions): JsonlParentScanner;
+export {};
 //# sourceMappingURL=jsonl-parent-scanner.d.ts.map

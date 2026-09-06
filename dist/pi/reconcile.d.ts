@@ -29,10 +29,9 @@
  *   - On ANY exception the rollover is left EXECUTING and a
  *     bounded diagnostic is emitted; no sleeps, no retries, no
  *     timeouts.
- *   - SessionStore.list returns summaries without
- *     `previous_session_ref`; this module reads each summary via
- *     `readById` to inspect the field. The public SessionStore
- *     contract is NOT expanded.
+ *   - Reconciliation enumerates authoritative session records and reads each
+ *     through `readById`, keeping ordinary SessionStore.list semantics intact
+ *     while preventing unreadable evidence from becoming a false zero.
  *   - The Pi JSONL scan is delegated to an injectable
  *     `JsonlParentScanner` so tests can drive the B branch
  *     deterministically. A thin filesystem-backed default is
@@ -45,41 +44,43 @@
  * No new state is added.
  */
 import { type SessionStore } from "../store/session-store.js";
+import type { StoreLayout } from "../store/paths.js";
 import type { Cmv3Store } from "../store/store.js";
 import type { RolloverFailureCode } from "../core/index.js";
-export type ReconcileAction =
-   | {
-        kind: "complete";
-        newSessionId: string;
-        rolloverId: string;
-     }
-   | {
-        kind: "fail";
-        failure_code: RolloverFailureCode;
-        failure_detail: string;
-        rolloverId: string;
-     }
-   | {
-        kind: "ambiguous";
-        rolloverId: string;
-        candidateCount: number;
-        source: "durable" | "jsonl";
-     }
-   | {
-        kind: "noop";
-        rolloverId: string;
-     };
+export type ReconcileAction = {
+    kind: "complete";
+    newSessionId: string;
+    rolloverId: string;
+} | {
+    kind: "fail";
+    failure_code: RolloverFailureCode;
+    failure_detail: string;
+    rolloverId: string;
+} | {
+    kind: "ambiguous";
+    rolloverId: string;
+    candidateCount: number;
+    source: "durable" | "jsonl";
+} | {
+    kind: "incomplete";
+    rolloverId: string;
+    detail: string;
+    source: "durable" | "jsonl";
+} | {
+    kind: "noop";
+    rolloverId: string;
+};
 export interface ReconcileOutcome {
-   readonly projectId: string;
-   readonly oldSessionId: string;
-   readonly scanned: number;
-   readonly actions: readonly ReconcileAction[];
-   readonly diagnostics: readonly ReconcileDiagnostic[];
+    readonly projectId: string;
+    readonly oldSessionId: string;
+    readonly scanned: number;
+    readonly actions: readonly ReconcileAction[];
+    readonly diagnostics: readonly ReconcileDiagnostic[];
 }
 export interface ReconcileDiagnostic {
-   readonly level: "info" | "warning" | "error";
-   readonly message: string;
-   readonly rolloverId?: string;
+    readonly level: "info" | "warning" | "error";
+    readonly message: string;
+    readonly rolloverId?: string;
 }
 /**
  * Injectable sink for diagnostics. The default in
@@ -87,24 +88,24 @@ export interface ReconcileDiagnostic {
  * capturing sink.
  */
 export interface DiagnosticSink {
-   emit(diagnostic: ReconcileDiagnostic): void;
+    emit(diagnostic: ReconcileDiagnostic): void;
 }
 /**
  * Result of a single child-lookup. Encodes the ambiguity
  * decision for the durable and JSONL branches.
  */
-export type ChildLookupResult =
-   | {
-        kind: "zero";
-     }
-   | {
-        kind: "one";
-        childId: string;
-     }
-   | {
-        kind: "ambiguous";
-        count: number;
-     };
+export type ChildLookupResult = {
+    kind: "zero";
+} | {
+    kind: "one";
+    childId: string;
+} | {
+    kind: "ambiguous";
+    count: number;
+} | {
+    kind: "incomplete";
+    detail: string;
+};
 /**
  * Injectable JSONL parentSession scanner. The B branch of the
  * reconciliation decision is driven by this; a production
@@ -118,27 +119,34 @@ export type ChildLookupResult =
  * a controlled set of ids.
  */
 export interface JsonlParentScanner {
-   /**
-    * Find Pi session ids whose JSONL `parentSession` field
-    * equals `oldSessionId`. Returned ids are Pi session
-    * files/ids that Pi created as children of the old session.
-    */
-   findChildren(oldSessionId: string): readonly string[];
+    /**
+     * Find Pi session ids whose JSONL `parentSession` field
+     * equals `oldSessionId`. Returned ids are Pi session
+     * files/ids that Pi created as children of the old session.
+     */
+    findChildren(oldSessionId: string): JsonlScanResult;
 }
+export type JsonlScanResult = {
+    readonly kind: "complete";
+    readonly children: readonly string[];
+} | {
+    readonly kind: "incomplete";
+    readonly detail: string;
+};
 /**
  * Options for one reconciliation pass.
  */
 export interface ReconcileInput {
-   readonly projectId: string;
-   readonly oldSessionId: string;
-   readonly store: Cmv3Store;
-   readonly jsonlScanner: JsonlParentScanner;
-   readonly sink: DiagnosticSink;
-   /**
-    * Override `Date.now()` for tests. ISO-8601 string is
-    * passed to the rollover store's `transition`.
-    */
-   readonly now?: () => string;
+    readonly projectId: string;
+    readonly oldSessionId: string;
+    readonly store: Cmv3Store;
+    readonly jsonlScanner: JsonlParentScanner;
+    readonly sink: DiagnosticSink;
+    /**
+     * Override `Date.now()` for tests. ISO-8601 string is
+     * passed to the rollover store's `transition`.
+     */
+    readonly now?: () => string;
 }
 /**
  * Reconcile every EXECUTING RolloverRequest in `projectId` whose
@@ -151,24 +159,21 @@ export interface ReconcileInput {
  * resolution. The caller is responsible for surfacing the
  * outcome's `diagnostics` to the user / observability layer.
  */
-export declare function reconcileInterruptedRollovers(
-   input: ReconcileInput,
-): ReconcileOutcome;
+export declare function reconcileInterruptedRollovers(input: ReconcileInput): ReconcileOutcome;
 interface FindDurableChildInput {
-   readonly projectId: string;
-   readonly oldSessionRef: string;
+    readonly projectId: string;
+    readonly layout: StoreLayout;
+    readonly oldSessionRef: string;
+    readonly checkpointRef: string;
+    readonly handoffRef: string;
 }
 /**
  * Find durable PICM child session records whose
  * `previous_session_ref` equals `oldSessionRef`. The SessionStore
- * public surface is preserved: `list` returns summaries (no
- * `previous_session_ref`); we re-open each summary via
- * `readById` to inspect the field.
+ * public surface is preserved. P04 scans the authoritative record directory
+ * directly, then uses `readById` for integrity validation.
  */
-export declare function findDurableChild(
-   sessions: SessionStore,
-   input: FindDurableChildInput,
-): ChildLookupResult;
+export declare function findDurableChild(sessions: SessionStore, input: FindDurableChildInput): ChildLookupResult;
 /**
  * Normalize a Pi session file path to the opaque id used in
  * `cmv3://session/<id>`. The S04 command does this when it
@@ -198,4 +203,5 @@ export declare function previousSessionRefFor(raw: string): string | null;
  * extension.ts.
  */
 export declare function consoleDiagnosticSink(): DiagnosticSink;
+export {};
 //# sourceMappingURL=reconcile.d.ts.map

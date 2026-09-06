@@ -29,10 +29,9 @@
  *   - On ANY exception the rollover is left EXECUTING and a
  *     bounded diagnostic is emitted; no sleeps, no retries, no
  *     timeouts.
- *   - SessionStore.list returns summaries without
- *     `previous_session_ref`; this module reads each summary via
- *     `readById` to inspect the field. The public SessionStore
- *     contract is NOT expanded.
+ *   - Reconciliation enumerates authoritative session records and reads each
+ *     through `readById`, keeping ordinary SessionStore.list semantics intact
+ *     while preventing unreadable evidence from becoming a false zero.
  *   - The Pi JSONL scan is delegated to an injectable
  *     `JsonlParentScanner` so tests can drive the B branch
  *     deterministically. A thin filesystem-backed default is
@@ -45,7 +44,11 @@
  * No new state is added.
  */
 
+import { readdirSync } from "node:fs";
+import { join } from "node:path";
+
 import { SESSION_REF_KIND, type SessionStore } from "../store/session-store.js";
+import type { StoreLayout } from "../store/paths.js";
 import type { Cmv3Store } from "../store/store.js";
 import type { RolloverFailureCode, RolloverRequest } from "../core/index.js";
 
@@ -65,6 +68,12 @@ export type ReconcileAction =
 			kind: "ambiguous";
 			rolloverId: string;
 			candidateCount: number;
+			source: "durable" | "jsonl";
+	  }
+	| {
+			kind: "incomplete";
+			rolloverId: string;
+			detail: string;
 			source: "durable" | "jsonl";
 	  }
 	| { kind: "noop"; rolloverId: string };
@@ -99,7 +108,8 @@ export interface DiagnosticSink {
 export type ChildLookupResult =
 	| { kind: "zero" }
 	| { kind: "one"; childId: string }
-	| { kind: "ambiguous"; count: number };
+	| { kind: "ambiguous"; count: number }
+	| { kind: "incomplete"; detail: string };
 
 /**
  * Injectable JSONL parentSession scanner. The B branch of the
@@ -119,8 +129,12 @@ export interface JsonlParentScanner {
 	 * equals `oldSessionId`. Returned ids are Pi session
 	 * files/ids that Pi created as children of the old session.
 	 */
-	findChildren(oldSessionId: string): readonly string[];
+	findChildren(oldSessionId: string): JsonlScanResult;
 }
+
+export type JsonlScanResult =
+	| { readonly kind: "complete"; readonly children: readonly string[] }
+	| { readonly kind: "incomplete"; readonly detail: string };
 
 /**
  * Options for one reconciliation pass.
@@ -175,7 +189,17 @@ export function reconcileInterruptedRollovers(
 				now,
 			});
 			actions.push(action);
-			if (action.kind === "ambiguous") {
+			if (action.kind === "incomplete") {
+				const diag: ReconcileDiagnostic = {
+					level: "error",
+					message:
+						`P04 reconciliation: incomplete ${action.source} evidence for rollover ${action.rolloverId} ` +
+						`(${action.detail}); rollover left EXECUTING.`,
+					rolloverId: action.rolloverId,
+				};
+				diagnostics.push(diag);
+				sink.emit(diag);
+			} else if (action.kind === "ambiguous") {
 				const diag: ReconcileDiagnostic = {
 					level: "warning",
 					message:
@@ -300,19 +324,19 @@ function reconcileOne(
 	try {
 		durableLookup = findDurableChild(ctx.store.sessions, {
 			projectId: ctx.projectId,
+			layout: ctx.store.layout,
 			oldSessionRef: liveRef,
+			checkpointRef: rollover.checkpoint_ref,
+			handoffRef: rollover.handoff_ref,
 		});
-	} catch {
-		// The B branch is the fallback. Errors on the A
-		// branch are NOT catastrophic — we still have the
-		// JSONL scanner as the backstop. We log and fall
-		// through to the B branch by treating the A branch
-		// as "zero candidates found". The error is
-		// captured into a NOOP action so the caller can
-		// surface it.
+	} catch (error) {
+		// Incomplete durable evidence cannot authorize a terminal
+		// transition, even if the JSONL source remains readable.
 		return {
-			kind: "noop",
+			kind: "incomplete",
 			rolloverId: rollover.rollover_request_id,
+			detail: `durable scan failed: ${boundedError(error)}`,
+			source: "durable",
 		};
 	}
 
@@ -321,6 +345,15 @@ function reconcileOne(
 			kind: "ambiguous",
 			rolloverId: rollover.rollover_request_id,
 			candidateCount: durableLookup.count,
+			source: "durable",
+		};
+	}
+
+	if (durableLookup.kind === "incomplete") {
+		return {
+			kind: "incomplete",
+			rolloverId: rollover.rollover_request_id,
+			detail: durableLookup.detail,
 			source: "durable",
 		};
 	}
@@ -357,12 +390,22 @@ function reconcileOne(
 	// B. Pi JSONL parentSession scan.
 	let jsonlLookup: ChildLookupResult;
 	try {
-		const jsonlChildren = ctx.jsonlScanner.findChildren(ctx.oldSessionId);
-		jsonlLookup = classifyChildren(jsonlChildren);
-	} catch {
+		const scan = ctx.jsonlScanner.findChildren(ctx.oldSessionId);
+		if (scan.kind === "incomplete") {
+			return {
+				kind: "incomplete",
+				rolloverId: rollover.rollover_request_id,
+				detail: scan.detail,
+				source: "jsonl",
+			};
+		}
+		jsonlLookup = classifyChildren(scan.children);
+	} catch (error) {
 		return {
-			kind: "noop",
+			kind: "incomplete",
 			rolloverId: rollover.rollover_request_id,
+			detail: `JSONL scan failed: ${boundedError(error)}`,
+			source: "jsonl",
 		};
 	}
 
@@ -439,35 +482,51 @@ function reconcileOne(
 
 interface FindDurableChildInput {
 	readonly projectId: string;
+	readonly layout: StoreLayout;
 	readonly oldSessionRef: string;
+	readonly checkpointRef: string;
+	readonly handoffRef: string;
 }
 
 /**
  * Find durable PICM child session records whose
  * `previous_session_ref` equals `oldSessionRef`. The SessionStore
- * public surface is preserved: `list` returns summaries (no
- * `previous_session_ref`); we re-open each summary via
- * `readById` to inspect the field.
+ * public surface is preserved. P04 scans the authoritative record directory
+ * directly, then uses `readById` for integrity validation.
  */
 export function findDurableChild(
 	sessions: SessionStore,
 	input: FindDurableChildInput,
 ): ChildLookupResult {
-	const summaries = sessions.list(input.projectId);
+	const directory = join(input.layout.projectsRoot, input.projectId, "sessions");
+	let ids: string[];
+	try {
+		ids = readdirSync(directory, { withFileTypes: true })
+			.filter((entry) => entry.isFile() && !entry.isSymbolicLink() && entry.name.endsWith(".json"))
+			.map((entry) => entry.name.slice(0, -".json".length))
+			.sort();
+	} catch (error) {
+		if (isMissingError(error)) return { kind: "zero" };
+		return { kind: "incomplete", detail: `cannot enumerate durable sessions: ${boundedError(error)}` };
+	}
 	const matches: string[] = [];
-	for (const summary of summaries) {
+	for (const id of ids) {
 		let record;
 		try {
-			record = sessions.readById(input.projectId, summary.id);
-		} catch {
-			// Unreadable record; skip and continue.
-			continue;
+			record = sessions.readById(input.projectId, id);
+		} catch (error) {
+			return {
+				kind: "incomplete",
+				detail: `cannot inspect durable session ${id}: ${boundedError(error)}`,
+			};
 		}
 		if (
 			typeof record.previous_session_ref === "string" &&
-			record.previous_session_ref === input.oldSessionRef
+			record.previous_session_ref === input.oldSessionRef &&
+			record.checkpoint_refs.includes(input.checkpointRef) &&
+			record.handoff_refs.includes(input.handoffRef)
 		) {
-			matches.push(record.session_id || summary.id);
+			matches.push(record.session_id || id);
 		}
 	}
 	if (matches.length === 0) return { kind: "zero" };
@@ -508,6 +567,16 @@ function classifyChildren(children: readonly string[]): ChildLookupResult {
 	if (children.length === 0) return { kind: "zero" };
 	if (children.length === 1) return { kind: "one", childId: children[0] };
 	return { kind: "ambiguous", count: children.length };
+}
+
+function boundedError(error: unknown): string {
+	const message = error instanceof Error ? error.message : String(error);
+	return message.slice(0, 300);
+}
+
+function isMissingError(error: unknown): boolean {
+	return typeof error === "object" && error !== null && "code" in error &&
+		(error as { code?: unknown }).code === "ENOENT";
 }
 
 /**
