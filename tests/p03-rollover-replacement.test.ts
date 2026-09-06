@@ -151,6 +151,8 @@ interface RollbackEvents {
 function makeRolloverHarness(opts: {
 	sendUserMessageBehavior: "resolve-fast" | "hang" | "reject" | "reject-after-delay";
 	newSessionShouldCancel?: boolean;
+	runtimeVersion?: string;
+	validatedSafeVersions?: readonly string[];
 }) {
 	const events: RollbackEvents = {
 		parentSession: undefined,
@@ -258,7 +260,11 @@ function makeRolloverHarness(opts: {
 			return { cancelled: false };
 		},
 	};
-	cmv3Extension(stub as unknown as Parameters<typeof cmv3Extension>[0]);
+	cmv3Extension(
+		stub as unknown as Parameters<typeof cmv3Extension>[0],
+		opts.runtimeVersion ?? "0.85.2",
+		opts.validatedSafeVersions ?? ["0.85.2"],
+	);
 	const cmd = cmdCaptured.find((c) => c.name === ROLLOVER_COMMAND_NAME);
 	if (!cmd) throw new Error("rollover command not registered");
 	const ssHandler = capturedObservers["session_start"]?.[0];
@@ -382,6 +388,73 @@ describe("PROBE B: replacement without prompt returns fast", () => {
 		assert.equal(sessions[0].id, "sess_new_01a0766f8a4e746d8326e45d27111f23");
 		assert.equal(sessions[0].status, "OPEN");
 		void reply;
+	});
+
+	it("refuses Pi 0.85.1 before READY transitions to EXECUTING", async () => {
+		const { store, path } = freshStore();
+		process.env["CMV3_STORE_PATH"] = path;
+		const cwd = freshCwd("runtime-guard");
+		const projectId = freshProjectId(cwd);
+		const oldSessionId = "/tmp/p03-runtime-guard.json";
+		const id = await drivePrepare({
+			store,
+			projectId,
+			oldSessionId,
+			workPackage: "WP-RUNTIME-GUARD",
+		});
+		const { cmd, ctx, events, ssHandler } = makeRolloverHarness({
+			sendUserMessageBehavior: "resolve-fast",
+			runtimeVersion: "0.85.1",
+		});
+		await driveSessionStart(ssHandler, cwd, oldSessionId);
+		await cmd.handler(`cmv3://rollover/${id}`, ctx);
+
+		assert.equal(events.order.includes("newSession:enter"), false);
+		assert.match(events.notifyCalls.at(-1)?.text ?? "", /refused rollover before EXECUTING/);
+		assert.equal(store.rollovers.read(`cmv3://rollover/${id}`, projectId).state, "READY");
+	});
+
+	it("refuses unvalidated Pi 0.85.2 without mutating READY or calling newSession", async () => {
+		const { store, path } = freshStore();
+		process.env["CMV3_STORE_PATH"] = path;
+		const cwd = freshCwd("runtime-unvalidated");
+		const projectId = freshProjectId(cwd);
+		const oldSessionId = "/tmp/p03-runtime-unvalidated.json";
+		const id = await drivePrepare({ store, projectId, oldSessionId, workPackage: "WP-UNVALIDATED" });
+		const { cmd, ctx, events, ssHandler } = makeRolloverHarness({
+			sendUserMessageBehavior: "resolve-fast",
+			runtimeVersion: "0.85.2",
+			validatedSafeVersions: [],
+		});
+		await driveSessionStart(ssHandler, cwd, oldSessionId);
+		await cmd.handler(id, ctx);
+
+		assert.equal(events.order.includes("newSession:enter"), false);
+		assert.match(events.notifyCalls.at(-1)?.text ?? "", /UNVALIDATED/);
+		const request = store.rollovers.read(`cmv3://rollover/${id}`, projectId);
+		assert.equal(request.state, "READY");
+		assert.equal(request.new_session_id, null);
+		assert.equal(request.failure_code, null);
+	});
+
+	it("refuses a missing runtime identity as UNVALIDATED", async () => {
+		const { store, path } = freshStore();
+		process.env["CMV3_STORE_PATH"] = path;
+		const cwd = freshCwd("runtime-unknown");
+		const projectId = freshProjectId(cwd);
+		const oldSessionId = "/tmp/p03-runtime-unknown.json";
+		const id = await drivePrepare({ store, projectId, oldSessionId, workPackage: "WP-UNKNOWN" });
+		const { cmd, ctx, events, ssHandler } = makeRolloverHarness({
+			sendUserMessageBehavior: "resolve-fast",
+			runtimeVersion: "",
+			validatedSafeVersions: [],
+		});
+		await driveSessionStart(ssHandler, cwd, oldSessionId);
+		await cmd.handler(id, ctx);
+
+		assert.equal(events.order.includes("newSession:enter"), false);
+		assert.match(events.notifyCalls.at(-1)?.text ?? "", /UNVALIDATED.*unknown/);
+		assert.equal(store.rollovers.read(`cmv3://rollover/${id}`, projectId).state, "READY");
 	});
 });
 

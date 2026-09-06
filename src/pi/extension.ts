@@ -86,6 +86,11 @@ import {
 	ToolResultAccessError,
 	ToolResultPersistenceError,
 } from "../store/tool-result-store.js";
+import {
+	classifyPiRuntimeCompatibility,
+	detectPiRuntimeVersion,
+	VALIDATED_SAFE_PI_VERSIONS,
+} from "./runtime-compatibility.js";
 
 /** Package identity. Mirrored from package.json for runtime introspection. */
 export const PACKAGE_NAME = "pi-context-management-improve";
@@ -120,7 +125,11 @@ export { RECOVERY_TOOL_NAME };
  * Default export. Wired as a Pi extension entrypoint per
  * `pi.extensions` in package.json.
  */
-export default function cmv3Extension(pi: ExtensionAPI): void {
+export default function cmv3Extension(
+	pi: ExtensionAPI,
+	runtimeVersion?: string,
+	validatedSafeVersions: readonly string[] = VALIDATED_SAFE_PI_VERSIONS,
+): void {
 	// Per-extension instance state. The Pi runtime is responsible
 	// for not loading the same extension twice; this state lives
 	// for the lifetime of one extension instance.
@@ -633,6 +642,22 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 			// refuse to start a second concurrent newSession.
 			if (request.state !== "READY") {
 				reply(`Rollover ${id} is in state ${request.state}; cannot execute.`);
+				return;
+			}
+			const runtimeCompatibility = classifyPiRuntimeCompatibility(
+				runtimeVersion ?? detectPiRuntimeVersion(),
+				validatedSafeVersions,
+			);
+			if (runtimeCompatibility.classification !== "SAFE") {
+				const reason = runtimeCompatibility.classification === "KNOWN_UNSAFE"
+					? "KNOWN_UNSAFE Pi runtime"
+					: "UNVALIDATED Pi runtime";
+				reply(
+					`PICM refused rollover before EXECUTING: ${reason} ` +
+					`${runtimeCompatibility.version} (${runtimeCompatibility.code}). ` +
+					`The public newSession path can terminate during runtime rebind before ` +
+					`withSession runs; use native fallback until a fixed Pi version is verified.`,
+				);
 				return;
 			}
 			// Move to EXECUTING.
