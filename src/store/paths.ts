@@ -16,10 +16,14 @@
  *       checkpoints/<id>.json
  *       handoffs/<id>.json
  *       sessions/<id>.json
+ *       tool-results/<id>/
+ *         metadata.json
+ *         payload.bin
  *       index/
  *         checkpoints.jsonl
  *         handoffs.jsonl
  *         sessions.jsonl
+ *         tool-results.jsonl
  *     schema.json
  *
  * Callers may override via:
@@ -78,6 +82,7 @@ export function projectSubpaths(): {
 	checkpoints: string;
 	handoffs: string;
 	sessions: string;
+	toolResults: string;
 	index: string;
 } {
 	return {
@@ -85,6 +90,7 @@ export function projectSubpaths(): {
 		checkpoints: "checkpoints",
 		handoffs: "handoffs",
 		sessions: "sessions",
+		toolResults: "tool-results",
 		index: "index",
 	};
 }
@@ -108,13 +114,39 @@ export function metadataPath(layout: StoreLayout, projectId: string): string {
 export function indexPath(
 	layout: StoreLayout,
 	projectId: string,
-	kind: "checkpoints" | "handoffs" | "sessions",
+	kind: "checkpoints" | "handoffs" | "sessions" | "tool-results",
 ): string {
 	return join(projectDir(layout, projectId), "index", `${kind}.jsonl`);
 }
 
 export function schemaPath(layout: StoreLayout): string {
 	return join(layout.root, SCHEMA_FILENAME);
+}
+
+/**
+ * Tool-result layout (S03). The authoritative record is a
+ * directory: `<id>/metadata.json` plus `<id>/payload.bin`. The
+ * id is the same opaque id used in the cmv3://tool/<id> ref.
+ * Filenames contain no command, payload, or absolute project path.
+ */
+export function toolResultDir(layout: StoreLayout, projectId: string, id: string): string {
+	return join(projectDir(layout, projectId), "tool-results", id);
+}
+
+export function toolResultMetadataPath(
+	layout: StoreLayout,
+	projectId: string,
+	id: string,
+): string {
+	return join(toolResultDir(layout, projectId, id), "metadata.json");
+}
+
+export function toolResultPayloadPath(
+	layout: StoreLayout,
+	projectId: string,
+	id: string,
+): string {
+	return join(toolResultDir(layout, projectId, id), "payload.bin");
 }
 
 /**

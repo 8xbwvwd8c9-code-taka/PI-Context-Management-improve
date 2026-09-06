@@ -41,6 +41,18 @@ export {
 } from "./session-store.js";
 
 export {
+	ToolResultAccessError,
+	ToolResultPersistenceError,
+	createToolResultStore,
+	rebuildToolResultIndex,
+	type ToolResultListFilters,
+	type ToolResultStore,
+	type ToolResultSummary,
+	type ToolResultWriteInput,
+	type ToolResultWriteOutput,
+} from "./tool-result-store.js";
+
+export {
 	ProjectMetadataIntegrityError,
 	createProjectStore,
 	type ProjectStore,
@@ -55,7 +67,13 @@ export {
 	projectIdFromSeedFull,
 } from "./ids.js";
 
-export { AtomicWriteError, atomicWriteFile, ensureDir } from "./atomic.js";
+export {
+	AtomicWriteError,
+	atomicWriteBytes,
+	atomicWriteFile,
+	ensureDir,
+	readBytes,
+} from "./atomic.js";
 export {
 	canonicalJsonStringify,
 	seal,
@@ -75,6 +93,9 @@ export {
 	projectDir,
 	resolveStorePath,
 	storeLayout,
+	toolResultDir,
+	toolResultMetadataPath,
+	toolResultPayloadPath,
 	CMV3_HOME_SUBDIR,
 	CMV3_SCHEMA_VERSION,
 	SCHEMA_FILENAME,
@@ -87,3 +108,22 @@ export {
 	SESSION_SCHEMA_VERSION,
 	METADATA_SCHEMA_VERSION,
 } from "./records.js";
+
+// Re-export the S03 tool-result pure contract so callers can
+// import validation and active-view helpers from the store barrel.
+export {
+	ACTIVE_VIEW_BOUNDS,
+	buildActiveView,
+	buildFailureActiveView,
+	buildSafeBoundedText,
+	DEFAULT_ACTIVE_VIEW_POLICY,
+	TOOL_RESULT_METADATA_SCHEMA_VERSION,
+	TOOL_RESULT_REF_KIND,
+	TOOL_RESULT_SCHEMA_VERSION,
+	validateActiveViewPolicy,
+	validateToolResultMetadata,
+	type ActiveViewPolicy,
+	type ToolResultActiveView,
+	type ToolResultKind,
+	type ToolResultMetadata,
+} from "../core/tool-result.js";

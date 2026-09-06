@@ -26,7 +26,7 @@ export interface IndexEntry {
 export function appendIndexEntry<T extends IndexEntry>(
 	layout: StoreLayout,
 	projectId: string,
-	kind: "checkpoints" | "handoffs" | "sessions",
+	kind: "checkpoints" | "handoffs" | "sessions" | "tool-results",
 	entry: T,
 ): void {
 	const path = indexPath(layout, projectId, kind);
@@ -37,7 +37,7 @@ export function appendIndexEntry<T extends IndexEntry>(
 export function readIndex<T extends IndexEntry>(
 	layout: StoreLayout,
 	projectId: string,
-	kind: "checkpoints" | "handoffs" | "sessions",
+	kind: "checkpoints" | "handoffs" | "sessions" | "tool-results",
 ): T[] {
 	const path = indexPath(layout, projectId, kind);
 	if (!existsSync(path)) return [];
@@ -58,7 +58,7 @@ export function readIndex<T extends IndexEntry>(
 export function rebuildIndex<T extends IndexEntry>(
 	layout: StoreLayout,
 	projectId: string,
-	kind: "checkpoints" | "handoffs" | "sessions",
+	kind: "checkpoints" | "handoffs" | "sessions" | "tool-results",
 	entries: T[],
 ): void {
 	const path = indexPath(layout, projectId, kind);
@@ -75,7 +75,7 @@ export function rebuildIndex<T extends IndexEntry>(
 export function clearIndex(
 	layout: StoreLayout,
 	projectId: string,
-	kind: "checkpoints" | "handoffs" | "sessions",
+	kind: "checkpoints" | "handoffs" | "sessions" | "tool-results",
 ): void {
 	const path = indexPath(layout, projectId, kind);
 	if (existsSync(path)) {

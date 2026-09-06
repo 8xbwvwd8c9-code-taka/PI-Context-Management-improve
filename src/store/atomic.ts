@@ -13,7 +13,7 @@
  * caller must pre-validate; we do not silently fall back.
  */
 
-import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, parse, sep } from "node:path";
 import { randomBytes } from "node:crypto";
 
@@ -124,3 +124,64 @@ export function ensureDir(dir: string, mode: number = 0o700): void {
 }
 
 export { sep as pathSeparator };
+
+/**
+ * Write raw bytes to `finalPath` atomically (binary-safe).
+ *
+ * S03 introduces this helper for the tool-result payload
+ * artifact. The contract is identical to `atomicWriteFile`:
+ *   1. ensure parent directory exists (mkdir -p)
+ *   2. choose a temp sibling in the SAME directory
+ *   3. write the temp file (raw bytes)
+ *   4. rename to finalPath (atomic on the same filesystem)
+ *
+ * Throws AtomicWriteError on any failure; the caller must NOT
+ * issue a ref in that case. The bytes are written as-is — UTF-8
+ * decode is the caller's responsibility and never implicit.
+ */
+export function atomicWriteBytes(
+	finalPath: string,
+	bytes: Uint8Array,
+	options: { mkdirMode?: number; fileMode?: number } = {},
+): AtomicWriteResult {
+	const dir = dirname(finalPath);
+	mkdirSync(dir, { recursive: true, mode: options.mkdirMode ?? 0o700 });
+
+	const tmp = makeTempPath(finalPath);
+	const fileMode = options.fileMode ?? 0o600;
+	try {
+		writeFileSync(tmp, bytes, { flag: "wx", mode: fileMode });
+	} catch (err) {
+		// Race: stale temp. Retry once with a fresh random suffix.
+		const retry = makeTempPath(finalPath);
+		try {
+			writeFileSync(retry, bytes, { flag: "wx", mode: fileMode });
+			renameSync(retry, finalPath);
+			return { path: finalPath, bytes: bytes.byteLength };
+		} catch (err2) {
+			throw new AtomicWriteError(
+				`atomic binary write failed for ${finalPath}: ${(err2 as Error).message}`,
+				finalPath,
+				err2,
+			);
+		}
+	}
+	try {
+		renameSync(tmp, finalPath);
+	} catch (err) {
+		throw new AtomicWriteError(
+			`atomic binary rename failed for ${finalPath}: ${(err as Error).message}`,
+			finalPath,
+			err,
+		);
+	}
+	return { path: finalPath, bytes: bytes.byteLength };
+}
+
+/**
+ * Read raw bytes from `path` with a hard failure on error. Used
+ * for full-byte tool-result recovery.
+ */
+export function readBytes(path: string): Uint8Array {
+	return readFileSync(path);
+}

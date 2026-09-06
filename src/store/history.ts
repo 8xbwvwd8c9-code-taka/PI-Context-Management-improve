@@ -8,6 +8,11 @@
  *   - no semantic / vector search
  *   - bounded, deterministic
  *
+ * S03 extends the History with `kind=tool` support. Tool-result
+ * entries are added to the index as METADATA ONLY — the raw
+ * payload never enters the derived JSONL index. The payload is
+ * always recovered from the authoritative artifact directory.
+ *
  * The history module is a thin layer over the per-record stores.
  * It does NOT restore arbitrary records into active context; the
  * caller selects explicitly.
@@ -24,9 +29,13 @@ import {
 import {
 	type SessionStore,
 } from "./session-store.js";
+import {
+	type ToolResultStore,
+	type ToolResultSummary,
+} from "./tool-result-store.js";
 import { type StoreLayout } from "./paths.js";
 
-export type RecordKind = "checkpoint" | "handoff" | "session";
+export type RecordKind = "checkpoint" | "handoff" | "session" | "tool";
 
 export interface HistoryQuery {
 	projectId: string;
@@ -35,6 +44,9 @@ export interface HistoryQuery {
 	status?: string;
 	since?: string;
 	until?: string;
+	toolName?: string;
+	sessionId?: string;
+	truncatedOnly?: boolean;
 }
 
 export interface HistoryEntry {
@@ -45,6 +57,13 @@ export interface HistoryEntry {
 	status?: string;
 	created_at?: string;
 	started_at?: string;
+	tool_name?: string;
+	session_id?: string;
+	original_bytes?: number;
+	stored_bytes?: number;
+	truncated_in_active_view?: boolean;
+	content_hash?: string;
+	mime_type?: string | null;
 }
 
 export class History {
@@ -54,11 +73,12 @@ export class History {
 			checkpoints: CheckpointStore;
 			handoffs: HandoffStore;
 			sessions: SessionStore;
+			toolResults?: ToolResultStore;
 		},
 	) {}
 
 	list(q: HistoryQuery): HistoryEntry[] {
-		const kinds: RecordKind[] = q.kinds ?? ["checkpoint", "handoff", "session"];
+		const kinds: RecordKind[] = q.kinds ?? ["checkpoint", "handoff", "session", "tool"];
 		const out: HistoryEntry[] = [];
 
 		if (kinds.includes("checkpoint")) {
@@ -101,6 +121,8 @@ export class History {
 				if (q.status && s.status !== q.status) continue;
 				if (q.since && s.started_at < q.since) continue;
 				if (q.until && s.started_at > q.until) continue;
+				if (q.toolName) continue;
+				if (q.sessionId && s.id !== q.sessionId) continue;
 				out.push({
 					kind: "session",
 					id: s.id,
@@ -108,6 +130,32 @@ export class History {
 					status: s.status,
 					started_at: s.started_at,
 				});
+			}
+		}
+		if (kinds.includes("tool")) {
+			if (this.stores.toolResults) {
+				const ts = this.stores.toolResults.list(q.projectId, {
+					toolName: q.toolName,
+					sessionId: q.sessionId,
+					since: q.since,
+					until: q.until,
+					truncatedOnly: q.truncatedOnly,
+				});
+				for (const t of ts) {
+					out.push({
+						kind: "tool",
+						id: t.id,
+						ref: t.ref,
+						tool_name: t.tool_name,
+						session_id: t.session_id ?? undefined,
+						created_at: t.created_at,
+						original_bytes: t.original_bytes,
+						stored_bytes: t.stored_bytes,
+						truncated_in_active_view: t.truncated_in_active_view ?? false,
+						content_hash: t.content_hash,
+						mime_type: t.mime_type,
+					});
+				}
 			}
 		}
 
@@ -125,9 +173,6 @@ export class History {
 		// Dispatch by URI scheme + kind prefix.
 		if (ref.startsWith("cmv3://checkpoint/")) {
 			const cps = this.stores.checkpoints;
-			// The S02 API does not parse out the project from the
-			// ref (refs are project-agnostic). The caller must call
-			// the typed store when a project is in scope.
 			void cps;
 			return null;
 		}
@@ -176,6 +221,25 @@ export class History {
 				ref: match.ref,
 				status: match.status,
 				started_at: match.started_at,
+			};
+		}
+		if (ref.startsWith("cmv3://tool/")) {
+			if (!this.stores.toolResults) return null;
+			const summaries: ToolResultSummary[] = this.stores.toolResults.list(projectId);
+			const match = summaries.find((s) => s.ref === ref);
+			if (!match) return null;
+			return {
+				kind: "tool",
+				id: match.id,
+				ref: match.ref,
+				tool_name: match.tool_name,
+				session_id: match.session_id ?? undefined,
+				created_at: match.created_at,
+				original_bytes: match.original_bytes,
+				stored_bytes: match.stored_bytes,
+				truncated_in_active_view: match.truncated_in_active_view ?? false,
+				content_hash: match.content_hash,
+				mime_type: match.mime_type,
 			};
 		}
 		return null;

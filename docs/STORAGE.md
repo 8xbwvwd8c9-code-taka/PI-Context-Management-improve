@@ -10,13 +10,14 @@ It implements:
 - durable **checkpoints** (R02 §6)
 - durable **minimal handoffs** (R02 §7)
 - durable **session records** (S02)
+- durable **tool-results** (S03): authoritative bytes + bounded active view
 - durable **project metadata**
 - a deterministic **history index** (rebuildable)
 - a deterministic **recovery** API
 
 It does **not**:
 
-- intercept Pi tool calls (S03)
+- intercept Pi tool calls automatically (S03 data plane only; live hook is S04+)
 - automatically trigger checkpoints (Pi integration comes later)
 - create a new Pi session (S04)
 - call `ctx.compact()` or otherwise replace native Pi compaction
@@ -32,10 +33,14 @@ The store lives outside any target Git repository by default.
     checkpoints/<id>.json
     handoffs/<id>.json
     sessions/<id>.json
+    tool-results/<id>/
+      metadata.json
+      payload.bin
     index/
       checkpoints.jsonl
       handoffs.jsonl
       sessions.jsonl
+      tool-results.jsonl
 ```
 
 `<opaque-project-id>` is a SHA-256-derived identifier (no absolute
@@ -70,6 +75,40 @@ Index files are **JSONL** (one entry per line). Each line is a
 small record with `ref`, `id`, and kind-specific metadata. Index
 files are derived data: they can be deleted and rebuilt from the
 authoritative records.
+
+## Tool-result artifacts (S03)
+
+A tool-result record is a per-id directory under
+`tool-results/<id>/`. The directory contains exactly two files:
+
+- `metadata.json` — the integrity-sealed envelope (see File
+  formats above). Carries the ref, project id, content hash,
+  sizes, encoding, MIME type, and tool metadata.
+- `payload.bin` — the authoritative bytes, written via atomic
+  binary rename. The byte length is recorded in the metadata; the
+  SHA-256 of the bytes is recorded in `content_hash` and is
+  re-verified on every read.
+
+The payload filename contains no command, no payload excerpt, and
+no absolute project path. The directory name is the same opaque
+id used in the ref.
+
+Tool-result history index entries are **metadata only** — the raw
+payload never enters the JSONL index. The index is rebuildable
+from the authoritative per-id directories via
+`rebuildToolResultIndex(layout, projectId)`.
+
+## Active view
+
+For a tool result, the **active view** is a deterministic,
+bounded, byte-level excerpt of the payload (UTF-8 head + marker
++ UTF-8 tail, or a safe lossy summary for non-UTF-8 binaries).
+The view is configured via `ActiveViewPolicy` and is the only
+representation of the tool result that lives in active context;
+the full bytes are recovered on demand via the ref.
+
+See `docs/TOOL_RESULT_VIRTUALIZATION.md` for the full S03
+contract.
 
 ## Atomicity
 

@@ -1,8 +1,12 @@
-# PI Context Management Improve (CMV3)
+# PI Context Management Improve (PICM)
 
 Portable, local-first context management for long-running Pi agents.
 
-Core operating model:
+PICM is an independent **Pi Skill + Extension package** for keeping
+active context small while preserving durable, recoverable work
+state across long-running sessions.
+
+## Core operating model
 
 ```text
 Work
@@ -12,44 +16,47 @@ Work
 → Continue
 ```
 
-CMV3 treats active context as temporary working memory and durable
+PICM treats active context as temporary working memory and durable
 project state as external, recoverable storage.
 
 ## Status
 
-**S02 — durable checkpoint / handoff / history**
+**S03 — tool-result virtualization**
 
 This package is currently in development. It is **not published**
 to npm. It is intended to be installed from this repository once
 the runtime behavior lands in S04.
 
-S02 adds a local-first filesystem store with:
+S03 adds tool-result durability on top of S02:
 
-- durable checkpoints (R02 §6)
-- durable minimal handoffs (R02 §7)
-- session records (S02)
-- project metadata
-- deterministic history index (rebuildable)
-- deterministic recovery (no LLM, fail-safe)
+- opaque tool-result refs (`cmv3://tool/<id>`)
+- durable full-byte persistence (UTF-8 text + arbitrary binary)
+- SHA-256 integrity verification on every read
+- bounded active view with head/tail preservation
+- byte-range recovery without reloading oversized payloads
+- derived `kind=tool` history index (metadata only, no raw payload)
+- index rebuild from authoritative records
+- prompt-injection-safe persistence (payload treated as inert data)
+- persistence-failure-safe active view (no ref on failure)
 
-S02 does NOT yet:
+S03 does NOT yet:
 
-- intercept tool results (S03)
-- automatically trigger checkpoints from Pi lifecycle (S04)
-- create a new Pi session (S04)
-- execute rollover (S04)
-- replace native Pi compaction
+- intercept live Pi tool output
+- automatically replace tool results in active context
+- create a new Pi session
+- execute rollover
+- call native Pi compaction
 
-Initial goals:
+Prior WPs:
 
-- portable Pi Skill + Extension package ✅ (S01)
-- local 32K models as a first-class runtime ✅ (S01 profiles)
-- durable checkpoint / handoff / session persistence ✅ (S02)
-- deterministic recovery without LLM ✅ (S02)
+- portable Pi Skill + Extension package (S01)
+- local 32K models as a first-class runtime (S01 profiles)
+- durable checkpoint / handoff / session persistence (S02)
+- deterministic recovery without LLM (S02)
+- tool-result virtualization (S03, current)
 - natural rollover at work-package boundaries (S04)
 - pressure rollover for long unfinished work (S04)
-- tool-result virtualization (S03)
-- deterministic cleanup before LLM compaction (S03)
+- deterministic cleanup before LLM compaction (post-S04)
 - native Pi compaction retained as emergency fallback (always)
 
 ## Installation
@@ -74,11 +81,11 @@ Or copy the package under `~/.pi/agent/npm/` and add it to your
 ## Architecture
 
 ```text
-CMV3
+PICM
 ├── Portable Core        (src/core/)
-├── Pi Runtime Extension (src/pi/)
+├── Pi Runtime Extension (src/pi/)        ← S01 no-op, S04+ live hooks
 ├── Project Adapters     (src/adapters/)
-├── Durable Store        (src/store/)  ← S02
+├── Durable Store        (src/store/)      ← S02 + S03 tool-result layer
 └── Skill                (skills/context-management/)
 ```
 
@@ -87,10 +94,11 @@ no I/O outside the package's own working area.
 
 The Pi Runtime Extension hosts lifecycle hooks, telemetry,
 tool-result interception, checkpoint trigger, and fresh-session
-rollover. In S02, the extension is still a no-op entrypoint.
+rollover. Through S03, the extension remains a no-op entrypoint;
+live hook wiring is deferred to S04+.
 
-The Durable Store (S02) is a local-first filesystem library. It
-lives outside the target Git repo by default and is responsible
+The Durable Store (S02 + S03) is a local-first filesystem library.
+It lives outside the target Git repo by default and is responsible
 for atomic writes, integrity verification, and deterministic
 recovery. It does NOT wire into the live Pi lifecycle.
 
@@ -166,21 +174,21 @@ npm run package:check
 | R01 — research / provenance | ✅ | External repository assimilation + license classification |
 | R02 — architecture freeze | ✅ | Frozen contracts: profiles, pressure, checkpoint, handoff, ref, tool-result, storage, modes |
 | S01 — portable package skeleton | ✅ | Combined Skill + Extension package, portable core, schemas, tests |
-| **S02 — checkpoint / handoff / history** | **current** | Durable store: checkpoints, handoffs, sessions, project metadata, history, recovery |
-| S03 — tool-result virtualization | next | Refs-backed tool result durability, integrity verification, on-demand recovery |
+| S02 — checkpoint / handoff / history | done | Durable store: checkpoints, handoffs, sessions, project metadata, history, recovery |
+| **S03 — tool-result virtualization** | **current** | Refs-backed tool result durability, integrity verification, bounded active view, on-demand recovery |
 | S04 — fresh-session rollover | next | Natural + pressure rollover orchestrator, mode-gated |
-| P01 — ST_BOT pilot | planned | First portability acceptance test |
-| P02 — unrelated second-project pilot | planned | Second portability acceptance test |
+| P01 — pilot 1 | planned | First portability acceptance test (separate downstream project) |
+| P02 — pilot 2 | planned | Second portability acceptance test (separate downstream project) |
 
 ## Authoritative documents
 
 - `docs/CMV3_PORTABLE_ARCHITECTURE_FREEZE.md` — frozen architecture (contract).
-- `docs/STORAGE.md` — durable store model, atomicity, integrity, recovery (S02).
+- `docs/STORAGE.md` — durable store model, atomicity, integrity, recovery (S02 + S03).
 - `docs/CHECKPOINT_RECOVERY.md` — checkpoint recovery contract (S02).
+- `docs/TOOL_RESULT_VIRTUALIZATION.md` — tool-result durability contract (S03).
 - `docs/ARCHITECTURE.md` — public high-level overview.
-- `docs/RESEARCH_PROVENANCE.md` — external repository license matrix.
-- `docs/research/CMV3_PORTABLE_ASSIMILATION.md` — full R01 research assimilation.
+- `docs/RESEARCH_PROVENANCE.md` — external research license matrix.
 
 ## License
 
-MIT (private during S01; license declared in `package.json`).
+MIT (private during S03; license declared in `package.json`).

@@ -2,9 +2,9 @@
  * Top-level CMV3 store façade.
  *
  * One `Cmv3Store` instance owns a `StoreLayout` and exposes the
- * individual record stores, history, and recovery helpers. S02
- * keeps the façade minimal; S04 (rollover) and S03 (tool-result
- * virtualization) will extend it.
+ * individual record stores, history, and recovery helpers. S03
+ * attaches the tool-result store; S04 (rollover) will extend the
+ * façade with the live orchestrator.
  */
 
 import { existsSync, mkdirSync, readdirSync } from "node:fs";
@@ -40,6 +40,15 @@ import {
 	type SessionStore,
 	type SessionSummary,
 } from "./session-store.js";
+import {
+	createToolResultStore,
+	rebuildToolResultIndex,
+	type ToolResultStore,
+	type ToolResultListFilters,
+	type ToolResultSummary,
+	type ToolResultWriteInput,
+	type ToolResultWriteOutput,
+} from "./tool-result-store.js";
 
 import { History, type HistoryQuery } from "./history.js";
 import {
@@ -54,6 +63,7 @@ export interface Cmv3Store {
 	readonly checkpoints: CheckpointStore;
 	readonly handoffs: HandoffStore;
 	readonly sessions: SessionStore;
+	readonly toolResults: ToolResultStore;
 	readonly projects: ProjectStore;
 	readonly history: History;
 	recover(projectId: string): ProjectRecovery;
@@ -88,8 +98,14 @@ export function openStore(options: OpenStoreOptions = {}): Cmv3Store {
 	const checkpoints = createCheckpointStore(layout);
 	const handoffs = createHandoffStore(layout);
 	const sessions = createSessionStore(layout);
+	const toolResults = createToolResultStore(layout);
 	const projects = createProjectStore(layout);
-	const history = new History(layout, { checkpoints, handoffs, sessions });
+	const history = new History(layout, {
+		checkpoints,
+		handoffs,
+		sessions,
+		toolResults,
+	});
 
 	return {
 		config,
@@ -97,6 +113,7 @@ export function openStore(options: OpenStoreOptions = {}): Cmv3Store {
 		checkpoints,
 		handoffs,
 		sessions,
+		toolResults,
 		projects,
 		history,
 		recover: (projectId) => recoverLatestProjectState(projects, checkpoints, handoffs, sessions, projectId),
@@ -156,6 +173,25 @@ export function rebuildAll(layout: StoreLayout, projectId: string): void {
 		return { ref: `cmv3://session/${id}`, id };
 	});
 	rebuildIndex(layout, projectId, "sessions", ssEntries);
+
+	// Tool-result index: metadata only, never the raw payload.
+	rebuildToolResultIndex(layout, projectId);
 }
 
-export type { CheckpointSummary, HandoffSummary, SessionSummary, HistoryQuery };
+export type {
+	CheckpointSummary,
+	HandoffSummary,
+	SessionSummary,
+	HistoryQuery,
+	ToolResultListFilters,
+	ToolResultSummary,
+	ToolResultWriteInput,
+	ToolResultWriteOutput,
+	ToolResultStore,
+};
+export {
+	ToolResultAccessError,
+	ToolResultPersistenceError,
+	createToolResultStore,
+	rebuildToolResultIndex,
+} from "./tool-result-store.js";
