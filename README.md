@@ -2,113 +2,135 @@
 
 Portable, local-first context management for long-running Pi agents.
 
-PICM is an independent **Pi Skill + Extension package** for keeping
-active context small while preserving durable, recoverable work
-state across long-running sessions.
+PICM is an independent **Pi Skill + optional Runtime Extension** designed to keep active context small while preserving durable, recoverable work state across long-running sessions.
+
+## Status
+
+**PICM v1.0 is feature-complete.**
+
+Validated capabilities include:
+
+- standalone Context Management Skill
+- optional Pi Runtime Extension
+- durable checkpoints and minimal handoffs
+- natural fresh-session rollover
+- pressure-triggered rollover
+- live tool-result virtualization
+- bounded on-demand recovery
+- restart-safe project/session history
+- Git and non-Git project support
+- zero-config generic operation
+- cross-project isolation and portability
+- no PICM-owned `ctx.compact()` calls
+- no Pi core patches
+- no automatic Git mutation
+
+Final v1.0 validation completed with **345 passing tests** across unit, integration, controlled runtime, packaging, and portability coverage.
+
+Package publication and repository tagging may still be pending.
 
 ## Core operating model
 
 ```text
 Work
 → Checkpoint
-→ NEW
+→ NEW Session
 → Minimal Handoff
 → Continue
 ```
 
-PICM treats active context as temporary working memory and durable
-project state as external, recoverable storage.
+Active context is treated as temporary working memory. Durable state lives outside the prompt and can be recovered when needed.
 
-## Status
+The goal is to avoid carrying an ever-growing transcript forward when only a small amount of structured state is required to continue useful work.
 
-**PICM v1.0** — cross-project portability validated.
+## Tool-result virtualization
 
-PICM v1 is the first stable release. It is the same packaged
-artifact, loaded from the same tarball, that drives the
-P02 cross-project portability validation: one Node Git
-target plus one non-Git Python target, both consuming the
-same install, both with zero project-specific PICM
-configuration, both with isolated stores and isolated
-project ids.
-
-PICM v1 ships:
-
-- a portable Skill + Extension package (S01)
-- local 32K models as a first-class runtime (S01 profiles)
-- durable checkpoint / handoff / session persistence (S02)
-- deterministic recovery without LLM (S02)
-- tool-result virtualization (S03)
-- natural rollover at work-package boundaries (S04)
-- pressure rollover for long unfinished work (S04)
-- live Pi runtime integration (S05): `session_start`,
-  `tool_result`, `agent_settled`, `picm_recover`
-- cross-project portability validated (P01, P02)
-
-PICM v1 does NOT:
-
-- introduce a database dependency
-- mutate the user's Git state
-- call `ctx.compact()`
-- require project-specific configuration
-- ship any host-project identifiers in the public surface
-- pollute target repositories with copied PICM source
-
-## Installation
-
-PICM v1 is a local-development artifact validated end-to-end
-through P02. It is **not published** to npm. The expected
-install command, once published, is:
+Large tool results are persisted before the active representation is reduced.
 
 ```text
-pi install npm:pi-context-management-improve
+Large Tool Result
+        ↓
+Durable Full Copy
+        +
+Bounded Active View
+        ↓
+Recover on Demand
 ```
 
-For local development, you can point Pi at the source tree:
+PICM preserves the authoritative result and exposes an opaque recovery reference such as:
 
 ```text
-pi -e /path/to/PI-Context-Management-improve
+cmv3://tool/<opaque-id>
 ```
 
-Or copy the package under `~/.pi/agent/npm/` and add it to your
-`settings.json` `packages` list. The P02 cross-project
-portability validation proves that the same packaged artifact
-works in any target project without source copies or
-project-specific configuration.
+The active context receives only a bounded deterministic representation, while the complete result remains available for exact or ranged recovery.
 
-## Architecture
+## Skill and Runtime
+
+PICM has two independent layers:
 
 ```text
 PICM
-├── Portable Core        (src/core/)
-├── Pi Runtime Extension (src/pi/)        ← S01 no-op, S04+ live hooks
-├── Project Adapters     (src/adapters/)
-├── Durable Store        (src/store/)      ← S02 + S03 tool-result layer
-└── Skill                (skills/context-management/)
+├── Skill
+│   └── context-management
+│
+└── Runtime Extension
+    ├── durable state
+    ├── pressure tracking
+    ├── tool-result virtualization
+    ├── recovery
+    └── session rollover
 ```
 
-The Portable Core is pure / deterministic. No Pi, no host project,
-no I/O outside the package's own working area.
+### Skill
 
-The Pi Runtime Extension hosts lifecycle hooks, tool-result
-virtualization, agent_settled pressure observer, the recovery
-tool, and fresh-session rollover. The extension is wired to
-the live Pi runtime in S05; the S04 orchestrator owns the
-`ctx.newSession` call.
+The Skill can be used independently.
 
-The Durable Store (S02 + S03) is a local-first filesystem library.
-It lives outside the target Git repo by default and is responsible
-for atomic writes, integrity verification, and deterministic
-recovery. It does NOT wire into the live Pi lifecycle.
+It teaches the agent to:
 
-The Skill is the agent-facing behavioral policy.
+- work in meaningful work packages
+- create structured checkpoints
+- keep handoffs minimal
+- start fresh context instead of repeatedly compressing old context
+- continue the same work package after pressure rollover
+- avoid copying the entire previous conversation into the next session
 
-Project Adapters are pure discovery. The Generic adapter works on
-any directory; the Git adapter is a thin wrapper that fills in
-Git fields when `.git` is present.
+### Runtime Extension
 
-## 32K local-first design
+The Runtime Extension adds automation:
 
-`local_32k` is a first-class profile, not an afterthought.
+- durable checkpoint / handoff / session storage
+- tool-result persistence and virtualization
+- context-pressure classification
+- natural and pressure rollover orchestration
+- fresh-session hydration
+- bounded historical recovery
+
+The Runtime Extension is optional; the Skill does not require it for basic behavioral guidance.
+
+## Runtime modes
+
+PICM supports three modes:
+
+| Mode | Behavior |
+| --- | --- |
+| `legacy` | Default. PICM does not change normal runtime behavior. |
+| `v3-observe` | Calculates pressure and diagnostics without replacing tool results or creating new sessions. |
+| `v3` | Enables durable tool virtualization, pressure handling, and fresh-session rollover. |
+
+The default remains:
+
+```text
+legacy
+```
+
+This makes installation non-invasive until PICM automation is explicitly enabled.
+
+## Local-first context policy
+
+PICM treats the physical context limit as a safety envelope, not a steady-state target.
+
+For a 32K local model:
 
 ```text
 max_context  32768
@@ -117,83 +139,203 @@ sweep        20000
 checkpoint   22000
 rollover     26000
 emergency    28672
-output_reserve 4096
 ```
 
-`max_context` and operating `target` are separate concepts.
-Output reserve is explicit. Thresholds are frozen — see
-`src/core/profiles.ts`.
+PICM also supports tiny and larger-context profiles without changing the core state model.
 
-The frozen profile values are also documented in
-`docs/CMV3_PORTABLE_ARCHITECTURE_FREEZE.md` §3.
-
-## Modes
+A typical pressure strategy is:
 
 ```text
-legacy      — no CMV3 behavioral takeover  (default)
-v3-observe  — calculate / record decisions but do not execute rollover
-v3          — full CMV3 behavior (S04+)
+NORMAL
+→ TARGET
+→ SWEEP
+→ CHECKPOINT
+→ ROLLOVER
+→ EMERGENCY
 ```
 
-Switch modes via `.cmv3.json` (or `.pi/cmv3.json`):
+Fresh-context rollover is preferred before repeated whole-context compaction becomes the primary operating mode.
 
-```json
-{
-  "mode": "v3-observe"
-}
-```
-
-Invalid modes fail safely. Missing config is OK; sane defaults apply.
-
-## Development
+## Architecture
 
 ```text
-npm install
-npm run typecheck
-npm test
-npm run build
-npm run package:check
+PICM
+├── Core
+│   ├── profiles
+│   ├── pressure
+│   ├── references
+│   ├── checkpoint
+│   ├── handoff
+│   ├── hydration
+│   └── rollover
+│
+├── Durable Store
+│   ├── projects
+│   ├── checkpoints
+│   ├── handoffs
+│   ├── sessions
+│   ├── rollovers
+│   ├── tool results
+│   └── rebuildable indexes
+│
+├── Pi Runtime Extension
+│   ├── session lifecycle
+│   ├── tool-result virtualization
+│   ├── pressure trigger
+│   ├── recovery tool
+│   └── fresh-session orchestration
+│
+├── Skill
+│   └── context-management
+│
+└── Project Adapters
+    ├── generic
+    └── git
 ```
 
-## Non-goals (v1)
+The portable core remains independent from application-specific project logic.
 
-- no host-project identifiers in the public surface
-- no database dependency
-- no semantic / vector history search
-- no automatic LLM-driven cleanup outside the deterministic
-  pre-NEW gate
-- no project-specific core code (PICM does not know the name
-  of any host project)
-- no source copy into target repositories
+## Durable storage
 
-## Roadmap
+PICM is local-first.
 
-| WP | Status | Goal |
-| --- | --- | --- |
-| R01 — research / provenance | done | External repository assimilation + license classification |
-| R02 — architecture freeze | done | Frozen contracts: profiles, pressure, checkpoint, handoff, ref, tool-result, storage, modes |
-| S01 — portable package skeleton | done | Combined Skill + Extension package, portable core, schemas, tests |
-| S02 — checkpoint / handoff / history | done | Durable store: checkpoints, handoffs, sessions, project metadata, history, recovery |
-| S03 — tool-result virtualization | done | Refs-backed tool result durability, integrity verification, bounded active view, on-demand recovery |
-| S04 — fresh-session rollover | done | Natural + pressure rollover orchestrator, deterministic state machine, pre-NEW hard gate, structured hydration, mode-gated |
-| S05 — live runtime integration | done | Wire S03/S04 to Pi runtime lifecycle hooks (session_start, tool_result, agent_settled), additive over S04 |
-| P01 — portability pilot | done | First portability acceptance test (controlled runtime pilot) |
-| P02 — cross-project portability | done | Final v1 portability gate: same packaged artifact in two unrelated projects (Git + non-Git) |
+The default durable store is outside the target project:
 
-PICM v1 is complete. The same packaged tarball (v1.0.0) drives
-the live Pi runtime, durable store, project adapters, and
-cross-project portability without target-specific core code.
+```text
+~/.pi/cmv3/
+```
 
-## Authoritative documents
+Authoritative records are stored separately from derived indexes.
 
-- `docs/CMV3_PORTABLE_ARCHITECTURE_FREEZE.md` — frozen architecture (contract).
-- `docs/STORAGE.md` — durable store model, atomicity, integrity, recovery (S02 + S03).
-- `docs/CHECKPOINT_RECOVERY.md` — checkpoint recovery contract (S02).
-- `docs/TOOL_RESULT_VIRTUALIZATION.md` — tool-result durability contract (S03).
-- `docs/FRESH_SESSION_ROLLOVER.md` — fresh-session rollover contract (S04).
-- `docs/ARCHITECTURE.md` — public high-level overview.
-- `docs/RESEARCH_PROVENANCE.md` — external research license matrix.
+Important properties:
+
+- atomic writes
+- SHA-256 integrity verification
+- opaque references
+- project isolation
+- rebuildable indexes
+- recovery without an LLM
+- Git and non-Git project support
+- no database dependency required
+
+PICM does not claim encryption at rest.
+
+## Recovery
+
+PICM keeps historical evidence outside active context and retrieves it only when needed.
+
+Supported recovery concepts include:
+
+- checkpoint recovery
+- handoff recovery
+- session linkage
+- tool-result metadata
+- bounded byte/range reads
+- restart recovery
+- index rebuild
+
+Large historical payloads are not blindly reinserted into context.
+
+## Safety and isolation
+
+PICM follows these invariants:
+
+- persist before destructive bounding
+- never fabricate recoverable refs after persistence failure
+- tool output is treated as untrusted data
+- tool payload text cannot become PICM control instructions
+- project A cannot read project B's durable records
+- PICM does not automatically commit, reset, stash, clean, or checkout Git state
+- PICM does not patch Pi core
+- PICM does not call `ctx.compact()`
+- native Pi compaction remains available as an emergency fallback
+
+## Zero-config portability
+
+PICM is designed to work without project-specific core code.
+
+Validated project shapes include:
+
+- generic Git projects
+- non-Git directories
+- different language/tooling layouts
+
+Project-specific behavior, if ever required, belongs behind adapters rather than inside the portable core.
+
+## Package
+
+Current version:
+
+```text
+1.0.0
+```
+
+The package exposes both:
+
+- the standalone `context-management` Skill
+- the Pi Runtime Extension
+
+The v1.0 package has passed same-artifact cross-project installation and smoke validation.
+
+Public package publication may still be pending.
+
+## Repository layout
+
+```text
+src/
+  core/
+  store/
+  pi/
+  adapters/
+
+skills/
+  context-management/
+
+docs/
+tests/
+```
+
+Key documentation:
+
+- `skills/context-management/SKILL.md`
+- `docs/ARCHITECTURE.md`
+- `docs/STORAGE.md`
+- `docs/CHECKPOINT_RECOVERY.md`
+- `docs/LIVE_RUNTIME.md`
+- `docs/TOOL_VIRTUALIZATION.md`
+- `docs/ROADMAP.md`
+
+## Design principles
+
+- active context is working memory, not durable storage
+- structured state is preferred over narrative memory
+- minimal handoff is preferred over transcript carryover
+- deterministic cleanup comes before LLM compaction
+- persistence must succeed before destructive truncation
+- recovery should work without an LLM
+- fresh-session rollover is preferred over summary-of-summary degradation
+- local models are first-class runtimes
+- project-specific behavior stays behind adapters
+- installation should not modify a target project's source tree
+
+## v1.0 completion
+
+PICM v1.0 has completed:
+
+```text
+Architecture
+→ Portable package
+→ Durable checkpoint / handoff / history
+→ Tool-result virtualization
+→ Fresh-session rollover
+→ Live runtime integration
+→ Controlled runtime validation
+→ Cross-project portability validation
+→ v1.0 COMPLETE
+```
+
+Further work after v1.0 is considered post-v1 improvement rather than required completion work.
 
 ## License
 
-MIT (declared in `package.json`).
+License and public distribution policy should be finalized before broad public package publication.
