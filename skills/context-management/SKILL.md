@@ -7,7 +7,8 @@ description: Portable context-management rules for long-running Pi agent work. U
 
 ## Purpose
 
-Keep long-running agent work reliable on small local context windows without depending on repeated whole-conversation compaction.
+Keep long-running agent work reliable on small local context windows
+without depending on repeated whole-conversation compaction.
 
 Primary model:
 
@@ -49,6 +50,9 @@ emergency    28672
 
 Always preserve explicit output reserve.
 
+For the full profile matrix, pressure states, and threshold
+semantics, see `references/PRESSURE.md`.
+
 ## Pressure handling order
 
 ```text
@@ -76,26 +80,31 @@ When a meaningful work package is complete:
 8. Start a fresh context.
 9. Inject only the minimal handoff needed for the next work package.
 
-Do not carry solved diagnostics, old test logs, stale file windows, or the entire prior conversation into the new context.
+Do not carry solved diagnostics, old test logs, stale file windows,
+or the entire prior conversation into the new context.
+
+For the full checkpoint contract, see `references/CHECKPOINT.md`.
 
 ## Pressure rollover
 
 When context approaches rollover pressure before the work package is complete:
 
 1. Persist all required recoverable evidence.
-2. Create an IN_PROGRESS checkpoint.
+2. Create an `IN_PROGRESS` checkpoint.
 3. Record done / current / blocked / next.
 4. Preserve exact recovery references for unresolved errors or evidence.
 5. Start a fresh context.
 6. Continue the same work package from the checkpoint.
 
-## Minimum checkpoint contract
+For the full handoff contract, see `references/HANDOFF.md`.
+
+## Minimum checkpoint contract (summary)
 
 A checkpoint should contain, when applicable:
 
 - goal
 - current work package
-- status
+- status (`COMPLETE` | `IN_PROGRESS` | `BLOCKED`)
 - completed work
 - work in progress
 - blockers
@@ -103,21 +112,23 @@ A checkpoint should contain, when applicable:
 - constraints
 - files read
 - files modified
-- relevant versions/hashes
+- relevant versions / hashes
 - tests run
 - test results
 - active errors
-- git branch
-- git HEAD
-- dirty/clean status
+- git branch / HEAD / dirty
 - next actions
 - recovery references
+- handoff summary
 
-Prefer structured state over narrative summaries.
+Prefer structured state over narrative summaries. The full field
+set lives in `references/CHECKPOINT.md`.
 
 ## Tool-result policy
 
-Large tool results such as pytest, git diff, grep, build logs, package-manager output, stack traces, and diagnostics should not remain verbatim in active context.
+Large tool results such as pytest, git diff, grep, build logs,
+package-manager output, stack traces, and diagnostics should not
+remain verbatim in active context.
 
 Target lifecycle:
 
@@ -133,7 +144,8 @@ Do not claim recoverability unless persistence succeeded.
 
 ## Project portability
 
-CMV3 core must not depend on ST_BOT, trading code, Python, or any one repository layout.
+CMV3 core must not depend on ST_BOT, trading code, Python, or any
+one repository layout.
 
 Project adapters may expose:
 
@@ -159,4 +171,6 @@ A generic Git repository should work with sane defaults.
 
 ## Success criterion
 
-A session is healthy when the agent can continue long-running work across fresh contexts while preserving correctness, with active context remaining small and important state remaining recoverable.
+A session is healthy when the agent can continue long-running work
+across fresh contexts while preserving correctness, with active
+context remaining small and important state remaining recoverable.

@@ -1,0 +1,68 @@
+{
+  "name": "pi-context-management-improve",
+  "version": "0.1.0",
+  "description": "Portable Pi context-management package (CMV3). Long-running task continuity with small active context, durable checkpoints, fresh-session rollover, and recoverable tool-result history. Local 32K first-class. Project-independent.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./core": {
+      "types": "./dist/core/index.d.ts",
+      "import": "./dist/core/index.js"
+    },
+    "./pi": {
+      "types": "./dist/pi/index.d.ts",
+      "import": "./dist/pi/index.js"
+    },
+    "./adapters": {
+      "types": "./dist/adapters/index.d.ts",
+      "import": "./dist/adapters/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi-package",
+    "context-management",
+    "cmv3",
+    "checkpoint",
+    "rollover",
+    "agent"
+  ],
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "tsx --test tests/*.test.ts",
+    "package:check": "node scripts/package-check.mjs"
+  },
+  "pi": {
+    "extensions": [
+      "./src/pi/extension.ts"
+    ],
+    "skills": [
+      "./skills/context-management"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "tsx": "^4.19.0",
+    "@types/node": "^22.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT",
+  "private": true
+}

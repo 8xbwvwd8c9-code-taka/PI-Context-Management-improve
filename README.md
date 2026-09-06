@@ -12,23 +12,154 @@ Work
 → Continue
 ```
 
-CMV3 treats active context as temporary working memory and durable project state as external, recoverable storage.
+CMV3 treats active context as temporary working memory and durable
+project state as external, recoverable storage.
 
 ## Status
 
-**R01 / portable extraction bootstrap**
+**S01 — portable Pi package skeleton**
 
-This repository is intentionally separated from ST_BOT. ST_BOT remains a pilot and knowledge source, not the owner of CMV3.
+This package is currently in development. It is **not published**
+to npm. It is intended to be installed from this repository once
+the runtime behavior lands in S04.
+
+S01 establishes packaging, module boundaries, configuration
+contracts, schemas/types, and test scaffolding. It does NOT
+implement active context-management behavior.
 
 Initial goals:
 
-- portable Pi Skill + Extension package
-- local 32K models as a first-class runtime
-- natural rollover at work-package boundaries
-- pressure rollover for long unfinished work
-- durable checkpoints and on-demand recovery
-- tool-result virtualization
-- deterministic cleanup before LLM compaction
-- native Pi compaction retained as emergency fallback
+- portable Pi Skill + Extension package ✅ (S01)
+- local 32K models as a first-class runtime ✅ (S01 profiles)
+- natural rollover at work-package boundaries (S04)
+- pressure rollover for long unfinished work (S04)
+- durable checkpoints and on-demand recovery (S02)
+- tool-result virtualization (S03)
+- deterministic cleanup before LLM compaction (S02/S03)
+- native Pi compaction retained as emergency fallback (always)
 
-See `skills/context-management/SKILL.md` and `docs/ARCHITECTURE.md`.
+## Installation
+
+**Not yet published.** S01 is a local-development skeleton.
+
+When the package is published, the expected install command is:
+
+```text
+pi install npm:pi-context-management-improve
+```
+
+For now, you can point Pi at the local checkout:
+
+```text
+pi -e /path/to/PI-Context-Management-improve
+```
+
+Or copy the package under `~/.pi/agent/npm/` and add it to your
+`settings.json` `packages` list.
+
+## Architecture
+
+```text
+CMV3
+├── Portable Core        (src/core/)
+├── Pi Runtime Extension (src/pi/)
+├── Project Adapters     (src/adapters/)
+└── Skill                (skills/context-management/)
+```
+
+The Portable Core is pure / deterministic. No Pi, no host project,
+no I/O outside the package's own working area.
+
+The Pi Runtime Extension hosts lifecycle hooks, telemetry,
+tool-result interception, checkpoint trigger, and fresh-session
+rollover. In S01, the extension is a no-op entrypoint that loads
+and registers the package identity; no live behavior is enabled.
+
+The Skill is the agent-facing behavioral policy.
+
+Project Adapters are pure discovery. The Generic adapter works on
+any directory; the Git adapter is a thin wrapper that fills in
+Git fields when `.git` is present.
+
+## 32K local-first design
+
+`local_32k` is a first-class profile, not an afterthought.
+
+```text
+max_context  32768
+target       16000
+sweep        20000
+checkpoint   22000
+rollover     26000
+emergency    28672
+output_reserve 4096
+```
+
+`max_context` and operating `target` are separate concepts.
+Output reserve is explicit. Thresholds are frozen — see
+`src/core/profiles.ts`.
+
+The frozen profile values are also documented in
+`docs/CMV3_PORTABLE_ARCHITECTURE_FREEZE.md` §3.
+
+## Modes
+
+```text
+legacy      — no CMV3 behavioral takeover  (default)
+v3-observe  — calculate / record decisions but do not execute rollover
+v3          — full CMV3 behavior (S04+)
+```
+
+Switch modes via `.cmv3.json` (or `.pi/cmv3.json`):
+
+```json
+{
+  "mode": "v3-observe"
+}
+```
+
+Invalid modes fail safely. Missing config is OK; sane defaults apply.
+
+## Development
+
+```text
+npm install
+npm run typecheck
+npm test
+npm run build
+npm run package:check
+```
+
+## Non-goals (S01)
+
+- no live context inspection
+- no tool interception
+- no checkpoint persistence
+- no rollover
+- no native-compaction calls
+- no live Pi config changes
+- no npm publish
+
+## Roadmap
+
+| WP | Status | Goal |
+| --- | --- | --- |
+| R01 — research / provenance | ✅ | External repository assimilation + license classification |
+| R02 — architecture freeze | ✅ | Frozen contracts: profiles, pressure, checkpoint, handoff, ref, tool-result, storage, modes |
+| **S01 — portable package skeleton** | **current** | Combined Skill + Extension package, portable core, schemas, tests |
+| S02 — checkpoint / handoff / history | next | Writers + readers + durable project/session state |
+| S03 — tool-result virtualization | next | Refs-backed tool result durability, integrity verification, on-demand recovery |
+| S04 — fresh-session rollover | next | Natural + pressure rollover orchestrator, mode-gated |
+| P01 — ST_BOT pilot | planned | First portability acceptance test |
+| P02 — unrelated second-project pilot | planned | Second portability acceptance test |
+
+## Authoritative documents
+
+- `docs/CMV3_PORTABLE_ARCHITECTURE_FREEZE.md` — frozen architecture (contract).
+- `docs/ARCHITECTURE.md` — public high-level overview.
+- `docs/RESEARCH_PROVENANCE.md` — external repository license matrix.
+- `docs/research/CMV3_PORTABLE_ASSIMILATION.md` — full R01 research assimilation.
+
+## License
+
+MIT (private during S01; license declared in `package.json`).
