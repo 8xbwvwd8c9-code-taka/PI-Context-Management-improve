@@ -67,6 +67,12 @@ import {
 	virtualizeToolResult,
 	type LiveToolResultInput,
 } from "./tool-result-live.js";
+import {
+	classifyPrepareOutcome,
+	shouldTriggerPressureRollover,
+	PressureTriggerMachine,
+} from "./pressure-trigger.js";
+import { RolloverOrchestratorError } from "../core/rollover-orchestrator.js";
 import type { ResolvedCMV3Config } from "../core/config.js";
 import type { ContextProfile } from "../core/profiles.js";
 import {
@@ -126,6 +132,29 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 	let resolvedConfig: ResolvedCMV3Config | null = null;
 	let activeProfile: ContextProfile = LOCAL_32K_PROFILE;
 
+	// Per-(project, session) pressure-trigger state machine. S05A
+	// dedup / loop guard. The active machine is the one for the
+	// currently live (project, session); previous entries are
+	// retained in the map for inspection (and are cleared when
+	// `session_start` fires for that exact key).
+	const pressureMachines = new Map<string, PressureTriggerMachine>();
+	const pressureMachineKey = (
+		projectId: string,
+		sessionId: string,
+	): string => `${projectId}::${sessionId}`;
+	const getPressureMachine = (): PressureTriggerMachine | null => {
+		const projectId = currentProjectId;
+		const sessionId = currentSessionId;
+		if (projectId === null || sessionId === null) return null;
+		const key = pressureMachineKey(projectId, sessionId);
+		let m = pressureMachines.get(key);
+		if (m === undefined) {
+			m = new PressureTriggerMachine(projectId, sessionId);
+			pressureMachines.set(key, m);
+		}
+		return m;
+	};
+
 	// ------------------------------------------------------------------
 	// 0) session_start: resolve mode / profile / project / session
 	// ------------------------------------------------------------------
@@ -149,6 +178,15 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 		activeProfile = initial.profile;
 		currentProjectId = initial.projectId;
 		currentSessionId = initial.oldSessionId;
+		// S05A: a new (project, session) starts with a fresh
+		// pressure-trigger machine. Any prior machine for this
+		// exact key is reset; machines for prior keys are
+		// retained for diagnostics.
+		const key = pressureMachineKey(initial.projectId, initial.oldSessionId);
+		pressureMachines.set(
+			key,
+			new PressureTriggerMachine(initial.projectId, initial.oldSessionId),
+		);
 		void LIVE_SESSION_START_HOOK_NAME;
 	});
 
@@ -391,15 +429,42 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 			// Project the handoff for the orchestrator's
 			// self-consistency check.
 			const ho = projectHandoffFromCheckpoint(cp);
-			const out = await orchestrator.prepare({
-				projectId,
-				oldSessionId,
-				checkpoint: cp,
-				handoff: ho,
-				reason: a.reason,
-				recovery_refs: cp.recovery_refs,
-				now,
-			});
+			// S05A: feed the prepare outcome back into the
+			// pressure-trigger machine so the dedup / retry
+			// budget is honored. A PRESSURE-triggered prepare
+			// that throws reports the failure to the machine;
+			// a successful prepare transitions the machine
+			// out of PENDING so the new session's
+			// `session_start` consumes the slot.
+			const pmForPrepare = getPressureMachine();
+			let out;
+			try {
+				out = await orchestrator.prepare({
+					projectId,
+					oldSessionId,
+					checkpoint: cp,
+					handoff: ho,
+					reason: a.reason,
+					recovery_refs: cp.recovery_refs,
+					now,
+				});
+			} catch (err) {
+				if (pmForPrepare !== null && a.reason === "PRESSURE") {
+					const failure_code =
+						err instanceof RolloverOrchestratorError
+							? err.failure_code
+							: "unknown";
+					pmForPrepare.applyPrepareOutcome(
+						classifyPrepareOutcome({ ok: false, failure_code }),
+					);
+				}
+				throw err;
+			}
+			if (pmForPrepare !== null && a.reason === "PRESSURE") {
+				pmForPrepare.applyPrepareOutcome(
+					classifyPrepareOutcome({ ok: true }),
+				);
+			}
 			return {
 				content: [
 					{
@@ -674,7 +739,7 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 	);
 
 	// ------------------------------------------------------------------
-	// 5) agent_settled: live pressure observation (S04 upgraded)
+	// 5) agent_settled: live pressure observation + S05A trigger
 	// ------------------------------------------------------------------
 	pi.on("agent_settled", async (_event, ctx) => {
 		if (resolvedConfig === null) {
@@ -710,16 +775,48 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 			agentSettled: true,
 			profileOverride: activeProfile,
 		});
+		// S05A: when the live decision is eligible for a
+		// pressure-driven rollover continuation, send exactly
+		// one trusted PICM custom message to the active
+		// session. The message uses
+		//   - customType: "picm-pressure-rollover"
+		//   - content: FIXED_TRUSTED_PICM_DIRECTIVE
+		//     (no payload, no transcript, no file content)
+		//   - display: false
+		//   - details: { pressureState, action, reason }
+		//     (deterministic pressure metadata only)
+		//   - triggerTurn: true
+		//   - deliverAs: "followUp"
 		// The observer never calls newSession. The observer
 		// never modifies native Pi compaction. The observer
-		// only records the decision in a diagnostic slot so
-		// operator tooling can see it. v3 may surface the
-		// `would_new_session` flag to the LLM as a hint to
-		// call `picm_prepare_rollover`; v3-observe and legacy
-		// are silent.
+		// is the SOLE pressure-side call site of
+		// `pi.sendMessage`; the S04 command remains the only
+		// newSession owner.
+		const pm = getPressureMachine();
+		if (pm !== null) {
+			const trig = shouldTriggerPressureRollover({
+				decision: out.decision,
+				mode: resolvedConfig.mode,
+				machine: pm,
+			});
+			if (trig.shouldSend && trig.call !== null) {
+				pi.sendMessage(
+					{
+						customType: trig.call.message.customType,
+						content: trig.call.message.content,
+						display: trig.call.message.display,
+						details: trig.call.message.details,
+					},
+					{
+						triggerTurn: trig.call.options.triggerTurn,
+						deliverAs: trig.call.options.deliverAs,
+					},
+				);
+				pm.markSent();
+			}
+		}
 		void LIVE_PRESSURE_HOOK_NAME;
 		void usage;
-		void out;
 	});
 }
 
@@ -732,6 +829,29 @@ export type { ContextProfile } from "../core/profiles.js";
 export type { ResolvedCMV3Config } from "../core/config.js";
 // Keep the public type re-exports stable for downstream tests.
 export type { ToolResultEvent } from "@earendil-works/pi-coding-agent";
+// S05A: re-export the pressure-trigger surface so tests can
+// drive the live handler through the public extension barrel.
+export {
+	PICM_PRESSURE_CUSTOM_TYPE,
+	FIXED_TRUSTED_PICM_DIRECTIVE,
+	PRESSURE_ROLLOVER_OPTIONS,
+	PRESSURE_DIRECTIVE_DENY_SUBSTRINGS,
+	PressureTriggerMachine,
+	buildPressureRolloverMessage,
+	buildPressureRolloverCall,
+	shouldTriggerPressureRollover,
+	classifyPrepareOutcome,
+} from "./pressure-trigger.js";
+export type {
+	PressureRolloverDetails,
+	PressureRolloverMessage,
+	PressureRolloverOptions,
+	PressureRolloverCall,
+	ShouldTriggerInput,
+	ShouldTriggerOutput,
+	PressureTriggerState,
+	PrepareOutcome,
+} from "./pressure-trigger.js";
 
 /**
  * Local structural type matching the runtime's

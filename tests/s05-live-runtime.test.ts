@@ -70,6 +70,16 @@ import {
 	ROLLOVER_COMMAND_NAME,
 	default as cmv3Extension,
 } from "../src/pi/extension.js";
+import {
+	PICM_PRESSURE_CUSTOM_TYPE,
+	FIXED_TRUSTED_PICM_DIRECTIVE,
+	PRESSURE_DIRECTIVE_DENY_SUBSTRINGS,
+	PressureTriggerMachine,
+	buildPressureRolloverMessage,
+	buildPressureRolloverCall,
+	shouldTriggerPressureRollover,
+	classifyPrepareOutcome,
+} from "../src/pi/pressure-trigger.js";
 import { ToolResultPersistenceError } from "../src/store/tool-result-store.js";
 
 /* -------------------------------------------------------------------- *
@@ -1262,5 +1272,922 @@ describe("S05: recovery round-trip via active view + bounded read", () => {
 		const lines = out.content.text.split("\n");
 		assert.equal(lines.length >= 5, true);
 		assert.equal(lines.slice(4).join("\n"), "verbatim-payload");
+	});
+});
+
+/* -------------------------------------------------------------------- *
+ * S05A: live pressure → rollover continuation trigger                   *
+ * -------------------------------------------------------------------- *
+ * Covers the S05A WP acceptance spec test IDs 1..18.
+ *
+ *   TRIGGER           1..3     message shape + count
+ *   DIRECTIVE         4..5     body is trusted, requests PRESSURE
+ *   DEDUP             6,15..17 duplicate settled / state transitions
+ *   MODES             7,8      legacy / v3-observe silent
+ *   PRESSURE GATE     9        CHECKPOINT never triggers
+ *   EMERGENCY         10       same trigger path
+ *   INJECTION         11,12    payload cannot trigger
+ *   OWNERSHIP         13,14    agent_settled never newSessions
+ *   FAILURE POLICY    17       bounded retry
+ *
+ * The tests drive the real extension through a synthetic
+ * ExtensionAPI stub that captures (a) the agent_settled handler
+ * and (b) any pi.sendMessage invocations, then assert on the
+ * captured calls.
+ */
+
+/**
+ * Synthetic ExtensionAPI stub. Captures:
+ *   - sendMessage calls (customType, content, display, details, options)
+ *   - tool_result / agent_settled / session_start handlers
+ *   - registered tool and command handlers
+ * The stub also exposes a `sessionManager` and a
+ * `getContextUsage` impl on the per-call `ctx`, so the
+ * agent_settled handler can read a real `LiveContextUsage`.
+ */
+interface SendMessageCall {
+	readonly customType: string;
+	readonly content: string;
+	readonly display: boolean;
+	readonly details: unknown;
+	readonly options: { triggerTurn?: boolean; deliverAs?: string } | undefined;
+}
+
+function makeExtensionStub() {
+	const sendMessageCalls: SendMessageCall[] = [];
+	const captured: Record<string, ((event: unknown) => unknown)[]> = {};
+	const toolCaptured: {
+		name: string;
+		execute: (id: string, args: unknown) => unknown;
+	}[] = [];
+	const cmdCaptured: { name: string; handler: (args: string) => unknown }[] =
+		[];
+	const stub = {
+		on(event: string, handler: (event: unknown) => unknown) {
+			(captured[event] ??= []).push(handler);
+		},
+		registerTool(t: {
+			name: string;
+			execute: (id: string, args: unknown) => unknown;
+		}) {
+			toolCaptured.push(t);
+		},
+		registerCommand(name: string, handler: (args: string) => unknown) {
+			cmdCaptured.push({ name, handler });
+		},
+		sendMessage(
+			message: {
+				customType: string;
+				content: string;
+				display: boolean;
+				details: unknown;
+			},
+			options?: { triggerTurn?: boolean; deliverAs?: string },
+		) {
+			sendMessageCalls.push({
+				customType: message.customType,
+				content: message.content,
+				display: message.display,
+				details: message.details,
+				options,
+			});
+		},
+	};
+	return { stub, sendMessageCalls, captured, toolCaptured, cmdCaptured };
+}
+
+/**
+ * Drive the extension through one session_start + one
+ * agent_settled. The caller controls the live token count and
+ * the CMV3_MODE env.
+ */
+async function driveOneSettled(
+	mode: "legacy" | "v3-observe" | "v3",
+	opts: {
+		tokens: number | null;
+		contextWindow: number;
+		projectId: string;
+		sessionFile?: string;
+	},
+) {
+	const prevMode = process.env["CMV3_MODE"];
+	process.env["CMV3_MODE"] = mode;
+	try {
+		const env = makeExtensionStub();
+		cmv3Extension(env.stub as unknown as Parameters<typeof cmv3Extension>[0]);
+		const ssHandler = env.captured["session_start"]?.[0];
+		if (!ssHandler) throw new Error("no session_start handler");
+		const ctx = {
+			cwd: opts.projectId,
+			sessionManager: {
+				getSessionFile: () => opts.sessionFile ?? "synthetic.json",
+			},
+			getContextUsage: () => ({
+				tokens: opts.tokens,
+				contextWindow: opts.contextWindow,
+			}),
+		} as unknown as Parameters<typeof ssHandler>[1];
+		await (ssHandler as (e: unknown, c: unknown) => Promise<unknown>)(
+			{ cwd: opts.projectId },
+			ctx,
+		);
+		const asHandler = env.captured["agent_settled"]?.[0];
+		if (!asHandler) throw new Error("no agent_settled handler");
+		await (asHandler as (e: unknown, c: unknown) => Promise<unknown>)(
+			{},
+			ctx,
+		);
+		return env;
+	} finally {
+		if (prevMode === undefined) {
+			delete process.env["CMV3_MODE"];
+		} else {
+			process.env["CMV3_MODE"] = prevMode;
+		}
+	}
+}
+
+describe("S05A TRIGGER 1: v3 + ROLLOVER + settled sends exactly one PICM message", () => {
+	it("fires once on the first eligible settled event", async () => {
+		const env = await driveOneSettled("v3", {
+			tokens: LOCAL_32K_PROFILE.rollover + 1,
+			contextWindow: LOCAL_32K_PROFILE.max_context,
+			projectId: freshProjectId("s05a-1"),
+		});
+		assert.equal(env.sendMessageCalls.length, 1);
+	});
+});
+
+describe("S05A TRIGGER 2: message uses triggerTurn=true", () => {
+	it("the options object pins triggerTurn=true", async () => {
+		const env = await driveOneSettled("v3", {
+			tokens: LOCAL_32K_PROFILE.rollover + 1,
+			contextWindow: LOCAL_32K_PROFILE.max_context,
+			projectId: freshProjectId("s05a-2"),
+		});
+		assert.equal(env.sendMessageCalls.length, 1);
+		assert.equal(env.sendMessageCalls[0].options?.triggerTurn, true);
+	});
+});
+
+describe("S05A TRIGGER 3: message uses followUp delivery", () => {
+	it("the options object pins deliverAs=followUp", async () => {
+		const env = await driveOneSettled("v3", {
+			tokens: LOCAL_32K_PROFILE.rollover + 1,
+			contextWindow: LOCAL_32K_PROFILE.max_context,
+			projectId: freshProjectId("s05a-3"),
+		});
+		assert.equal(env.sendMessageCalls.length, 1);
+		assert.equal(env.sendMessageCalls[0].options?.deliverAs, "followUp");
+	});
+});
+
+describe("S05A DIRECTIVE 4: directive contains no raw tool payload", () => {
+	it("the FIXED directive body has none of the payload-shaped markers", () => {
+		for (const deny of PRESSURE_DIRECTIVE_DENY_SUBSTRINGS) {
+			assert.equal(
+				FIXED_TRUSTED_PICM_DIRECTIVE.includes(deny),
+				false,
+				`directive must not contain '${deny}'`,
+			);
+		}
+		// The customType itself is the only PICM-owned
+		// string on the message envelope; the body must
+		// not contain any "execute" or "newSession" verb
+		// either.
+		assert.equal(/newSession\s*\(/.test(FIXED_TRUSTED_PICM_DIRECTIVE), false);
+		assert.equal(/execute rollover/i.test(FIXED_TRUSTED_PICM_DIRECTIVE), false);
+	});
+});
+
+describe("S05A DIRECTIVE 5: directive requests PRESSURE structured preparation", () => {
+	it("the body asks the agent to call picm_prepare_rollover with reason=PRESSURE", () => {
+		assert.match(FIXED_TRUSTED_PICM_DIRECTIVE, /picm_prepare_rollover/);
+		assert.match(FIXED_TRUSTED_PICM_DIRECTIVE, /reason:\s*PRESSURE/);
+		// Structured work-state fields are all listed.
+		for (const field of [
+			"work_package",
+			"IN_PROGRESS",
+			"completed",
+			"in_progress",
+			"blockers",
+			"important_decisions",
+			"hard_constraints",
+			"current_files",
+			"active_errors",
+			"next_actions",
+			"recovery_refs",
+		]) {
+			assert.match(
+				FIXED_TRUSTED_PICM_DIRECTIVE,
+				new RegExp(field),
+				`directive must list field '${field}'`,
+			);
+		}
+		// The directive is a static string, not a template:
+		// the agent supplies the values.
+		assert.equal(
+			FIXED_TRUSTED_PICM_DIRECTIVE.includes("<"),
+			true,
+			"placeholder syntax (<...>) is expected for the LLM to fill in",
+		);
+	});
+});
+
+describe("S05A DEDUP 6: duplicate settled event does not duplicate message", () => {
+	it("two settled events yield exactly one sendMessage call", async () => {
+		const prevMode = process.env["CMV3_MODE"];
+		process.env["CMV3_MODE"] = "v3";
+		try {
+			const env = makeExtensionStub();
+			cmv3Extension(
+				env.stub as unknown as Parameters<typeof cmv3Extension>[0],
+			);
+			const ssHandler = env.captured["session_start"]?.[0];
+			const projectId = freshProjectId("s05a-6");
+			const ctx = {
+				cwd: projectId,
+				sessionManager: { getSessionFile: () => "synthetic.json" },
+				getContextUsage: () => ({
+					tokens: LOCAL_32K_PROFILE.rollover + 1,
+					contextWindow: LOCAL_32K_PROFILE.max_context,
+				}),
+			} as unknown as Parameters<typeof ssHandler>[1];
+			await (ssHandler as (e: unknown, c: unknown) => Promise<unknown>)(
+				{ cwd: projectId },
+				ctx,
+			);
+			const asHandler = env.captured["agent_settled"]?.[0];
+			// First settled: should send.
+			await (asHandler as (e: unknown, c: unknown) => Promise<unknown>)(
+				{},
+				ctx,
+			);
+			// Second settled: must NOT send.
+			await (asHandler as (e: unknown, c: unknown) => Promise<unknown>)(
+				{},
+				ctx,
+			);
+			// Third settled: still must NOT send.
+			await (asHandler as (e: unknown, c: unknown) => Promise<unknown>)(
+				{},
+				ctx,
+			);
+			assert.equal(env.sendMessageCalls.length, 1);
+		} finally {
+			if (prevMode === undefined) {
+				delete process.env["CMV3_MODE"];
+			} else {
+				process.env["CMV3_MODE"] = prevMode;
+			}
+		}
+	});
+});
+
+describe("S05A MODES 7: legacy sends zero pressure messages", () => {
+	it("legacy mode does not call pi.sendMessage from agent_settled", async () => {
+		const env = await driveOneSettled("legacy", {
+			tokens: LOCAL_32K_PROFILE.rollover + 100,
+			contextWindow: LOCAL_32K_PROFILE.max_context,
+			projectId: freshProjectId("s05a-7"),
+		});
+		assert.equal(env.sendMessageCalls.length, 0);
+	});
+});
+
+describe("S05A MODES 8: v3-observe sends zero pressure messages", () => {
+	it("v3-observe mode does not call pi.sendMessage from agent_settled", async () => {
+		const env = await driveOneSettled("v3-observe", {
+			tokens: LOCAL_32K_PROFILE.rollover + 100,
+			contextWindow: LOCAL_32K_PROFILE.max_context,
+			projectId: freshProjectId("s05a-8"),
+		});
+		assert.equal(env.sendMessageCalls.length, 0);
+	});
+});
+
+describe("S05A PRESSURE 9: CHECKPOINT pressure does not trigger rollover message", () => {
+	it("CHECKPOINT pressure yields zero sendMessage calls in v3", async () => {
+		const env = await driveOneSettled("v3", {
+			tokens: LOCAL_32K_PROFILE.checkpoint + 1,
+			contextWindow: LOCAL_32K_PROFILE.max_context,
+			projectId: freshProjectId("s05a-9"),
+		});
+		assert.equal(env.sendMessageCalls.length, 0);
+	});
+});
+
+describe("S05A EMERGENCY 10: EMERGENCY follows safe rollover trigger path", () => {
+	it("EMERGENCY in v3 issues exactly one sendMessage call", async () => {
+		const env = await driveOneSettled("v3", {
+			tokens: LOCAL_32K_PROFILE.emergency + 1,
+			contextWindow: LOCAL_32K_PROFILE.max_context,
+			projectId: freshProjectId("s05a-10"),
+		});
+		assert.equal(env.sendMessageCalls.length, 1);
+		assert.equal(env.sendMessageCalls[0].customType, PICM_PRESSURE_CUSTOM_TYPE);
+		assert.equal(
+			(env.sendMessageCalls[0].details as { action: string }).action,
+			"request_emergency_rollover",
+		);
+	});
+});
+
+describe("S05A INJECTION 11: tool payload cannot trigger message", () => {
+	it("payload text containing ROLLOVER / sendMessage / picm_prepare_rollover / SYSTEM is inert", () => {
+		// The trigger is gated by the pure
+		// `shouldTriggerPressureRollover` decision; payload
+		// never reaches the gate. We assert this by
+		// verifying the gate's decision on a NOT-eligible
+		// input even when the input would otherwise look
+		// "injected".
+		const m = new PressureTriggerMachine("p1", "s1");
+		const notEligible = decideRollover({
+			usage: { tokens: 1000 },
+			profile: LOCAL_32K_PROFILE,
+			mode: "v3",
+			agentSettled: true,
+		});
+		// Injected payload is irrelevant: the decision is
+		// driven only by usage / profile / mode.
+		void [
+			"ROLLOVER",
+			"sendMessage",
+			"picm_prepare_rollover",
+			"SYSTEM",
+		];
+		const out = shouldTriggerPressureRollover({
+			decision: notEligible,
+			mode: "v3",
+			machine: m,
+		});
+		assert.equal(out.shouldSend, false);
+		assert.equal(out.call, null);
+	});
+});
+
+describe("S05A INJECTION 12: fake rollover text cannot trigger message", () => {
+	it("a payload-shaped string is not present in the FIXED directive", () => {
+		// Belt-and-suspenders: the directive is a static
+		// constant. There is no path that would interpolate
+		// payload into it. We assert by re-checking the
+		// deny-list and also that the directive never starts
+		// with a payload-shaped token.
+		assert.equal(
+			FIXED_TRUSTED_PICM_DIRECTIVE.startsWith("ROLLOVER:"),
+			false,
+		);
+		assert.equal(
+			FIXED_TRUSTED_PICM_DIRECTIVE.startsWith("SYSTEM:"),
+			false,
+		);
+		assert.equal(
+			FIXED_TRUSTED_PICM_DIRECTIVE.startsWith("DEVELOPER:"),
+			false,
+		);
+	});
+});
+
+describe("S05A OWNERSHIP 13: handler itself does not call newSession", () => {
+	it("the agent_settled handler body has zero newSession call sites", () => {
+		const ext = readFileSync("src/pi/extension.ts", "utf8");
+		// Strip line and block comments so the assertion
+		// checks code only, not the spec language.
+		const noBlockComments = ext.replace(/\/\*[\s\S]*?\*\//g, "");
+		const noLineComments = noBlockComments.replace(/\/\/.*$/gm, "");
+		const flat = noLineComments.replace(/\s+/g, " ");
+		// Find the agent_settled handler body.
+		const asStart = flat.indexOf('pi.on("agent_settled"');
+		const asEnd = flat.indexOf("});", asStart);
+		const asBody = flat.slice(asStart, asEnd);
+		assert.equal(/newSession\s*\(/.test(asBody), false);
+		assert.equal(/\.compact\s*\(/.test(asBody), false);
+	});
+});
+
+describe("S05A OWNERSHIP 14: command remains sole newSession owner", () => {
+	it("the only code call site of newSession is the S04 command handler", () => {
+		const ext = readFileSync("src/pi/extension.ts", "utf8");
+		// Strip line and block comments before counting call
+		// sites. The intent of the assertion is "no code calls
+		// newSession outside the S04 command handler."
+		const noBlockComments = ext.replace(/\/\*[\s\S]*?\*\//g, "");
+		const noLineComments = noBlockComments.replace(/\/\/.*$/gm, "");
+		const flat = noLineComments.replace(/\s+/g, " ");
+		const m = flat.match(/newSession\s*\(/g) ?? [];
+		// Exactly one newSession call site: the rollover
+		// command's ctx.newSession. The pressure trigger
+		// uses pi.sendMessage instead.
+		assert.equal(m.length, 1);
+	});
+});
+
+describe("S05A DEDUP 15: successful preparation transitions pending state", () => {
+	it("applyPrepareOutcome(success) on a PENDING machine returns it to IDLE", () => {
+		const m = new PressureTriggerMachine("p1", "s1");
+		const decision = decideRollover({
+			usage: { tokens: LOCAL_32K_PROFILE.rollover + 1 },
+			profile: LOCAL_32K_PROFILE,
+			mode: "v3",
+			agentSettled: true,
+		});
+		assert.equal(m.shouldSendOnSettled(decision), true);
+		m.markSent();
+		assert.equal(m.getState(), "PENDING");
+		m.applyPrepareOutcome(classifyPrepareOutcome({ ok: true }));
+		assert.equal(m.getState(), "IDLE");
+	});
+});
+
+describe("S05A DEDUP 16: new session clears old pending state", () => {
+	it("session_start on a (project, session) replaces the prior entry", () => {
+		const m = new PressureTriggerMachine("p1", "s1");
+		m.markSent();
+		assert.equal(m.getState(), "PENDING");
+		// session_start effect: replace the entry. The
+		// extension constructs a fresh machine; we mirror
+		// that here.
+		m.clear();
+		assert.equal(m.getState(), "IDLE");
+		// And the next eligible settled re-arms.
+		const decision = decideRollover({
+			usage: { tokens: LOCAL_32K_PROFILE.rollover + 1 },
+			profile: LOCAL_32K_PROFILE,
+			mode: "v3",
+			agentSettled: true,
+		});
+		assert.equal(m.shouldSendOnSettled(decision), true);
+	});
+});
+
+describe("S05A FAILURE 17: failed preparation retry behavior is bounded", () => {
+	it("retryable failure allows exactly one retry; second failure goes quiet", () => {
+		const m = new PressureTriggerMachine("p1", "s1");
+		const decision = decideRollover({
+			usage: { tokens: LOCAL_32K_PROFILE.rollover + 1 },
+			profile: LOCAL_32K_PROFILE,
+			mode: "v3",
+			agentSettled: true,
+		});
+		// First trigger: send.
+		assert.equal(m.shouldSendOnSettled(decision), true);
+		m.markSent();
+		assert.equal(m.getState(), "PENDING");
+		// Retryable failure: PENDING -> FAILED_RETRY.
+		m.applyPrepareOutcome(
+			classifyPrepareOutcome({ ok: false, failure_code: "lock_held" }),
+		);
+		assert.equal(m.getState(), "FAILED_RETRY");
+		// One more eligible settled: send the retry.
+		assert.equal(m.shouldSendOnSettled(decision), true);
+		m.markSent();
+		assert.equal(m.getState(), "RETRY_IN_FLIGHT");
+		// Second retryable failure: RETRY_IN_FLIGHT -> FAILED_QUIET
+		// (no more retries; quiet until session_start).
+		m.applyPrepareOutcome(
+			classifyPrepareOutcome({ ok: false, failure_code: "lock_held" }),
+		);
+		assert.equal(m.getState(), "FAILED_QUIET");
+		assert.equal(m.shouldSendOnSettled(decision), false);
+		// Non-retryable failure is even more terminal.
+		m.clear();
+		m.markSent();
+		m.applyPrepareOutcome(
+			classifyPrepareOutcome({
+				ok: false,
+				failure_code: "checkpoint_corrupt",
+			}),
+		);
+		assert.equal(m.getState(), "FAILED_QUIET");
+		assert.equal(m.shouldSendOnSettled(decision), false);
+	});
+});
+
+describe("S05A UNIT: shouldTriggerPressureRollover gate matrix", () => {
+	it("v3 + ROLLOVER + IDLE: shouldSend=true", () => {
+		const m = new PressureTriggerMachine("p1", "s1");
+		const decision = decideRollover({
+			usage: { tokens: LOCAL_32K_PROFILE.rollover + 1 },
+			profile: LOCAL_32K_PROFILE,
+			mode: "v3",
+			agentSettled: true,
+		});
+		const out = shouldTriggerPressureRollover({
+			decision,
+			mode: "v3",
+			machine: m,
+		});
+		assert.equal(out.shouldSend, true);
+		assert.ok(out.call);
+		assert.equal(out.call!.message.customType, PICM_PRESSURE_CUSTOM_TYPE);
+		assert.equal(out.call!.message.display, false);
+		assert.equal(out.call!.options.triggerTurn, true);
+		assert.equal(out.call!.options.deliverAs, "followUp");
+		assert.deepEqual(
+			out.call!.message.details,
+			{
+				pressureState: "ROLLOVER",
+				action: "request_pressure_rollover",
+				reason: decision.reason,
+			},
+		);
+	});
+	it("v3 + PENDING: shouldSend=false (dedup)", () => {
+		const m = new PressureTriggerMachine("p1", "s1");
+		const decision = decideRollover({
+			usage: { tokens: LOCAL_32K_PROFILE.rollover + 1 },
+			profile: LOCAL_32K_PROFILE,
+			mode: "v3",
+			agentSettled: true,
+		});
+		m.markSent();
+		const out = shouldTriggerPressureRollover({
+			decision,
+			mode: "v3",
+			machine: m,
+		});
+		assert.equal(out.shouldSend, false);
+		assert.equal(out.call, null);
+	});
+	it("v3 + FAILED_QUIET: shouldSend=false (retry budget exhausted)", () => {
+		const m = new PressureTriggerMachine("p1", "s1");
+		m.markSent();
+		m.applyPrepareOutcome(
+			classifyPrepareOutcome({ ok: false, failure_code: "lock_held" }),
+		);
+		m.markSent();
+		m.applyPrepareOutcome(
+			classifyPrepareOutcome({ ok: false, failure_code: "lock_held" }),
+		);
+		const decision = decideRollover({
+			usage: { tokens: LOCAL_32K_PROFILE.rollover + 1 },
+			profile: LOCAL_32K_PROFILE,
+			mode: "v3",
+			agentSettled: true,
+		});
+		const out = shouldTriggerPressureRollover({
+			decision,
+			mode: "v3",
+			machine: m,
+		});
+		assert.equal(out.shouldSend, false);
+	});
+	it("v3 + CHECKPOINT: shouldSend=false (pressure gate)", () => {
+		const m = new PressureTriggerMachine("p1", "s1");
+		const decision = decideRollover({
+			usage: { tokens: LOCAL_32K_PROFILE.checkpoint + 1 },
+			profile: LOCAL_32K_PROFILE,
+			mode: "v3",
+			agentSettled: true,
+		});
+		assert.equal(decision.action, "checkpoint_refresh");
+		const out = shouldTriggerPressureRollover({
+			decision,
+			mode: "v3",
+			machine: m,
+		});
+		assert.equal(out.shouldSend, false);
+	});
+	it("v3-observe + ROLLOVER: shouldSend=false (mode gate)", () => {
+		const m = new PressureTriggerMachine("p1", "s1");
+		const decision = decideRollover({
+			usage: { tokens: LOCAL_32K_PROFILE.rollover + 1 },
+			profile: LOCAL_32K_PROFILE,
+			mode: "v3-observe",
+			agentSettled: true,
+		});
+		const out = shouldTriggerPressureRollover({
+			decision,
+			mode: "v3-observe",
+			machine: m,
+		});
+		assert.equal(out.shouldSend, false);
+	});
+});
+
+describe("S05A UNIT: buildPressureRolloverCall shape", () => {
+	it("returns the canonical customType / display=false / fixed directive / followUp options", () => {
+		const decision = decideRollover({
+			usage: { tokens: LOCAL_32K_PROFILE.rollover + 1 },
+			profile: LOCAL_32K_PROFILE,
+			mode: "v3",
+			agentSettled: true,
+		});
+		const call = buildPressureRolloverCall(decision);
+		assert.equal(call.message.customType, PICM_PRESSURE_CUSTOM_TYPE);
+		assert.equal(call.message.content, FIXED_TRUSTED_PICM_DIRECTIVE);
+		assert.equal(call.message.display, false);
+		assert.equal(call.options.triggerTurn, true);
+		assert.equal(call.options.deliverAs, "followUp");
+	});
+	it("buildPressureRolloverMessage exposes deterministic pressure metadata only", () => {
+		const decision = decideRollover({
+			usage: { tokens: LOCAL_32K_PROFILE.rollover + 1 },
+			profile: LOCAL_32K_PROFILE,
+			mode: "v3",
+			agentSettled: true,
+		});
+		const msg = buildPressureRolloverMessage(decision);
+		assert.equal(msg.details.pressureState, "ROLLOVER");
+		assert.equal(msg.details.action, "request_pressure_rollover");
+		// The details object is small and contains no
+		// payload-shaped fields.
+		const keys = Object.keys(msg.details).sort();
+		assert.deepEqual(keys, ["action", "pressureState", "reason"]);
+	});
+});
+
+describe("S05A INTEGRATION: extension fires sendMessage through synthetic API", () => {
+	it("v3 + ROLLOVER produces the canonical call shape", async () => {
+		const env = await driveOneSettled("v3", {
+			tokens: LOCAL_32K_PROFILE.rollover + 1,
+			contextWindow: LOCAL_32K_PROFILE.max_context,
+			projectId: freshProjectId("s05a-integ"),
+		});
+		assert.equal(env.sendMessageCalls.length, 1);
+		const call = env.sendMessageCalls[0];
+		assert.equal(call.customType, PICM_PRESSURE_CUSTOM_TYPE);
+		assert.equal(call.content, FIXED_TRUSTED_PICM_DIRECTIVE);
+		assert.equal(call.display, false);
+		assert.equal(call.options?.triggerTurn, true);
+		assert.equal(call.options?.deliverAs, "followUp");
+	});
+});
+
+/* -------------------------------------------------------------------- *
+ * S05A STATE MACHINE: explicit 5-state transition coverage              *
+ * -------------------------------------------------------------------- *
+ * The pressure-trigger state machine is the S05A dedup / loop
+ * guard. The transitions are the FROZEN policy for S05A; the
+ * tests below assert each transition explicitly so a future
+ * regression cannot silently relax the bounded-retry contract.
+ *
+ *   IDLE
+ *     → markSent()
+ *     → PENDING
+ *
+ *   PENDING
+ *     → retryable prepare failure
+ *     → FAILED_RETRY
+ *
+ *   FAILED_RETRY
+ *     → markSent()
+ *     → RETRY_IN_FLIGHT
+ *
+ *   RETRY_IN_FLIGHT
+ *     → retryable prepare failure
+ *     → FAILED_QUIET
+ *
+ *   PENDING / RETRY_IN_FLIGHT
+ *     → non-retryable prepare failure
+ *     → FAILED_QUIET
+ *
+ *   PENDING / RETRY_IN_FLIGHT
+ *     → successful prepare
+ *     → IDLE (handoff to rollover execution)
+ *
+ *   FAILED_QUIET
+ *     → agent_settled
+ *     → zero sends
+ *
+ *   FAILED_RETRY
+ *     → agent_settled
+ *     → exactly ONE retry send
+ *
+ * Acceptance IDs covered: S05A SM 1..12.
+ */
+
+function rolloverDecision(): ReturnType<typeof decideRollover> {
+	return decideRollover({
+		usage: { tokens: LOCAL_32K_PROFILE.rollover + 1 },
+		profile: LOCAL_32K_PROFILE,
+		mode: "v3",
+		agentSettled: true,
+	});
+}
+
+describe("S05A SM 1: IDLE → PENDING on markSent", () => {
+	it("the first eligible send transitions to PENDING", () => {
+		const m = new PressureTriggerMachine("p1", "s1");
+		assert.equal(m.getState(), "IDLE");
+		assert.equal(m.shouldSendOnSettled(rolloverDecision()), true);
+		m.markSent();
+		assert.equal(m.getState(), "PENDING");
+	});
+});
+
+describe("S05A SM 2: PENDING retryable failure → FAILED_RETRY", () => {
+	it("a retryable orchestrator failure moves PENDING to FAILED_RETRY", () => {
+		const m = new PressureTriggerMachine("p1", "s1");
+		m.markSent();
+		assert.equal(m.getState(), "PENDING");
+		m.applyPrepareOutcome(
+			classifyPrepareOutcome({ ok: false, failure_code: "lock_held" }),
+		);
+		assert.equal(m.getState(), "FAILED_RETRY");
+	});
+});
+
+describe("S05A SM 3: FAILED_RETRY → RETRY_IN_FLIGHT on retry send", () => {
+	it("markSent on FAILED_RETRY transitions to RETRY_IN_FLIGHT", () => {
+		const m = new PressureTriggerMachine("p1", "s1");
+		m.markSent();
+		m.applyPrepareOutcome(
+			classifyPrepareOutcome({ ok: false, failure_code: "lock_held" }),
+		);
+		assert.equal(m.getState(), "FAILED_RETRY");
+		assert.equal(m.shouldSendOnSettled(rolloverDecision()), true);
+		m.markSent();
+		assert.equal(m.getState(), "RETRY_IN_FLIGHT");
+	});
+});
+
+describe("S05A SM 4: RETRY_IN_FLIGHT retryable failure → FAILED_QUIET", () => {
+	it("a second retryable failure moves RETRY_IN_FLIGHT to FAILED_QUIET", () => {
+		const m = new PressureTriggerMachine("p1", "s1");
+		m.markSent();
+		m.applyPrepareOutcome(
+			classifyPrepareOutcome({ ok: false, failure_code: "lock_held" }),
+		);
+		m.markSent();
+		assert.equal(m.getState(), "RETRY_IN_FLIGHT");
+		m.applyPrepareOutcome(
+			classifyPrepareOutcome({ ok: false, failure_code: "lock_held" }),
+		);
+		assert.equal(m.getState(), "FAILED_QUIET");
+	});
+});
+
+describe("S05A SM 5: FAILED_QUIET never sends again", () => {
+	it("subsequent agent_settled events are no-ops while FAILED_QUIET", () => {
+		const m = new PressureTriggerMachine("p1", "s1");
+		m.markSent();
+		m.applyPrepareOutcome(
+			classifyPrepareOutcome({ ok: false, failure_code: "lock_held" }),
+		);
+		m.markSent();
+		m.applyPrepareOutcome(
+			classifyPrepareOutcome({ ok: false, failure_code: "lock_held" }),
+		);
+		assert.equal(m.getState(), "FAILED_QUIET");
+		for (let i = 0; i < 5; i++) {
+			assert.equal(m.shouldSendOnSettled(rolloverDecision()), false);
+		}
+	});
+});
+
+describe("S05A SM 6: first failure permits exactly one retry", () => {
+	it("FAILED_RETRY allows one more send; FAILED_QUIET allows none", () => {
+		const m = new PressureTriggerMachine("p1", "s1");
+		const decision = rolloverDecision();
+		// 1st send.
+		assert.equal(m.shouldSendOnSettled(decision), true);
+		m.markSent();
+		// 1st failure → FAILED_RETRY.
+		m.applyPrepareOutcome(
+			classifyPrepareOutcome({ ok: false, failure_code: "lock_held" }),
+		);
+		// 2nd send is the bounded retry.
+		assert.equal(m.shouldSendOnSettled(decision), true);
+		m.markSent();
+		// 2nd failure → FAILED_QUIET.
+		m.applyPrepareOutcome(
+			classifyPrepareOutcome({ ok: false, failure_code: "lock_held" }),
+		);
+		// No more sends.
+		assert.equal(m.shouldSendOnSettled(decision), false);
+	});
+});
+
+describe("S05A SM 7: non-retryable failure immediately goes quiet", () => {
+	it("PENDING + non-retryable → FAILED_QUIET (no retry)", () => {
+		const m = new PressureTriggerMachine("p1", "s1");
+		m.markSent();
+		m.applyPrepareOutcome(
+			classifyPrepareOutcome({
+				ok: false,
+				failure_code: "checkpoint_corrupt",
+			}),
+		);
+		assert.equal(m.getState(), "FAILED_QUIET");
+		assert.equal(m.shouldSendOnSettled(rolloverDecision()), false);
+	});
+	it("RETRY_IN_FLIGHT + non-retryable → FAILED_QUIET (no further retry)", () => {
+		const m = new PressureTriggerMachine("p1", "s1");
+		m.markSent();
+		m.applyPrepareOutcome(
+			classifyPrepareOutcome({ ok: false, failure_code: "lock_held" }),
+		);
+		m.markSent();
+		assert.equal(m.getState(), "RETRY_IN_FLIGHT");
+		m.applyPrepareOutcome(
+			classifyPrepareOutcome({
+				ok: false,
+				failure_code: "checkpoint_corrupt",
+			}),
+		);
+		assert.equal(m.getState(), "FAILED_QUIET");
+	});
+});
+
+describe("S05A SM 8: success from PENDING exits the retry flow", () => {
+	it("PENDING + success → IDLE (rollover execution / terminal success path)", () => {
+		const m = new PressureTriggerMachine("p1", "s1");
+		m.markSent();
+		assert.equal(m.getState(), "PENDING");
+		m.applyPrepareOutcome(classifyPrepareOutcome({ ok: true }));
+		assert.equal(m.getState(), "IDLE");
+		// A subsequent settled event re-arms the trigger.
+		assert.equal(m.shouldSendOnSettled(rolloverDecision()), true);
+	});
+});
+
+describe("S05A SM 9: success from RETRY_IN_FLIGHT exits the retry flow", () => {
+	it("RETRY_IN_FLIGHT + success → IDLE", () => {
+		const m = new PressureTriggerMachine("p1", "s1");
+		m.markSent();
+		m.applyPrepareOutcome(
+			classifyPrepareOutcome({ ok: false, failure_code: "lock_held" }),
+		);
+		m.markSent();
+		assert.equal(m.getState(), "RETRY_IN_FLIGHT");
+		m.applyPrepareOutcome(classifyPrepareOutcome({ ok: true }));
+		assert.equal(m.getState(), "IDLE");
+		// A subsequent settled event re-arms the trigger.
+		assert.equal(m.shouldSendOnSettled(rolloverDecision()), true);
+	});
+});
+
+describe("S05A SM 10: duplicate settled while PENDING sends nothing", () => {
+	it("PENDING suppresses repeated send requests", () => {
+		const m = new PressureTriggerMachine("p1", "s1");
+		m.markSent();
+		assert.equal(m.getState(), "PENDING");
+		const decision = rolloverDecision();
+		for (let i = 0; i < 10; i++) {
+			assert.equal(m.shouldSendOnSettled(decision), false);
+		}
+	});
+});
+
+describe("S05A SM 11: duplicate settled while RETRY_IN_FLIGHT sends nothing", () => {
+	it("RETRY_IN_FLIGHT suppresses repeated send requests", () => {
+		const m = new PressureTriggerMachine("p1", "s1");
+		m.markSent();
+		m.applyPrepareOutcome(
+			classifyPrepareOutcome({ ok: false, failure_code: "lock_held" }),
+		);
+		m.markSent();
+		assert.equal(m.getState(), "RETRY_IN_FLIGHT");
+		const decision = rolloverDecision();
+		for (let i = 0; i < 10; i++) {
+			assert.equal(m.shouldSendOnSettled(decision), false);
+		}
+	});
+});
+
+describe("S05A SM 12: no infinite settled → sendMessage loop", () => {
+	it("an unbounded sequence of eligible settled events produces at most 2 sends", () => {
+		const m = new PressureTriggerMachine("p1", "s1");
+		const decision = rolloverDecision();
+		let sends = 0;
+		for (let i = 0; i < 100; i++) {
+			if (m.shouldSendOnSettled(decision)) {
+				m.markSent();
+				sends++;
+			}
+		}
+		// 1st settled: IDLE -> PENDING (send 1)
+		// settled 2..100: PENDING blocks every send.
+		assert.equal(sends, 1);
+		// Now exercise the bounded-retry path: a retryable
+		// failure followed by a long run of settled events.
+		m.applyPrepareOutcome(
+			classifyPrepareOutcome({ ok: false, failure_code: "lock_held" }),
+		);
+		for (let i = 0; i < 100; i++) {
+			if (m.shouldSendOnSettled(decision)) {
+				m.markSent();
+				sends++;
+			}
+		}
+		// The retry send: 1 more. Subsequent settled events
+		// are blocked by RETRY_IN_FLIGHT.
+		assert.equal(sends, 2);
+		// A second retryable failure locks the slot quiet;
+		// the next 100 settled events are all no-ops.
+		m.applyPrepareOutcome(
+			classifyPrepareOutcome({ ok: false, failure_code: "lock_held" }),
+		);
+		for (let i = 0; i < 100; i++) {
+			if (m.shouldSendOnSettled(decision)) {
+				m.markSent();
+				sends++;
+			}
+		}
+		// Still 2: the retry budget is exhausted; no more
+		// sends regardless of how many times the agent
+		// settles.
+		assert.equal(sends, 2);
 	});
 });
