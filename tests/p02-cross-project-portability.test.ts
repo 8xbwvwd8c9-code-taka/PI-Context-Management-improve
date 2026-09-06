@@ -331,7 +331,7 @@ async function startSession(
 	},
 ): Promise<SyntheticCtx> {
 	const api = buildSyntheticApi(env);
-	cmv3Extension(api);
+	cmv3Extension(api, "0.85.2", ["0.85.2"]);
 	const handler = env.sessionStartHandlers[env.sessionStartHandlers.length - 1];
 	assert.ok(handler, "session_start handler not registered");
 	const ctx = makeSyntheticCtx(env, {

@@ -357,6 +357,8 @@ async function startSession(
 	const api = buildSyntheticApi(env);
 	cmv3Extension(
 		api.stub as unknown as Parameters<typeof cmv3Extension>[0],
+		"0.85.2",
+		["0.85.2"],
 	);
 	const handler = env.sessionStartHandlers[env.sessionStartHandlers.length - 1];
 	assert.ok(handler, "session_start handler not registered");

@@ -64,6 +64,12 @@ import {
 	resolveLiveRuntime,
 } from "./session-init.js";
 import {
+	consoleDiagnosticSink,
+	reconcileInterruptedRollovers,
+	type JsonlParentScanner,
+} from "./reconcile.js";
+import { createFsJsonlParentScanner } from "./jsonl-parent-scanner.js";
+import {
 	failOpenForPersistenceError,
 	virtualizeToolResult,
 	type LiveToolResultInput,
@@ -80,6 +86,11 @@ import {
 	ToolResultAccessError,
 	ToolResultPersistenceError,
 } from "../store/tool-result-store.js";
+import {
+	classifyPiRuntimeCompatibility,
+	detectPiRuntimeVersion,
+	VALIDATED_SAFE_PI_VERSIONS,
+} from "./runtime-compatibility.js";
 
 /** Package identity. Mirrored from package.json for runtime introspection. */
 export const PACKAGE_NAME = "pi-context-management-improve";
@@ -114,7 +125,11 @@ export { RECOVERY_TOOL_NAME };
  * Default export. Wired as a Pi extension entrypoint per
  * `pi.extensions` in package.json.
  */
-export default function cmv3Extension(pi: ExtensionAPI): void {
+export default function cmv3Extension(
+	pi: ExtensionAPI,
+	runtimeVersion?: string,
+	validatedSafeVersions: readonly string[] = VALIDATED_SAFE_PI_VERSIONS,
+): void {
 	// Per-extension instance state. The Pi runtime is responsible
 	// for not loading the same extension twice; this state lives
 	// for the lifetime of one extension instance.
@@ -139,10 +154,8 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 	// retained in the map for inspection (and are cleared when
 	// `session_start` fires for that exact key).
 	const pressureMachines = new Map<string, PressureTriggerMachine>();
-	const pressureMachineKey = (
-		projectId: string,
-		sessionId: string,
-	): string => `${projectId}::${sessionId}`;
+	const pressureMachineKey = (projectId: string, sessionId: string): string =>
+		`${projectId}::${sessionId}`;
 	const getPressureMachine = (): PressureTriggerMachine | null => {
 		const projectId = currentProjectId;
 		const sessionId = currentSessionId;
@@ -156,6 +169,14 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 		return m;
 	};
 
+	// P04 — interrupted-rollover recovery. The scanner is
+	// filesystem-backed by default; tests inject a stub via the
+	// `cmv3SetReconcileScanner` test-only setter (see end of
+	// file). The sink is console-backed in production and
+	// overridable via `cmv3SetReconcileSink` for tests.
+	let reconcileScanner: JsonlParentScanner = createFsJsonlParentScanner();
+	let reconcileSink = consoleDiagnosticSink();
+
 	// ------------------------------------------------------------------
 	// 0) session_start: resolve mode / profile / project / session
 	// ------------------------------------------------------------------
@@ -163,6 +184,7 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 		const cwd = ctx.cwd;
 		const ev = event as { previousSessionFile?: string };
 		const previousSessionFile = ev.previousSessionFile;
+		const startReason = (event as { reason?: string }).reason ?? "startup";
 		// The runtime may not expose the active model's context
 		// window yet (it may be null right at start). We pass
 		// `undefined` to let the session-init helper default to
@@ -179,6 +201,33 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 		activeProfile = initial.profile;
 		currentProjectId = initial.projectId;
 		currentSessionId = initial.oldSessionId;
+		// P04: on Pi startup, reconcile any RolloverRequest
+		// stuck in EXECUTING. Per the WP, this runs ONLY when
+		// the runtime reports `reason === "startup"`. For
+		// `new` / `resume` / `fork` / `reload`, a rollover in
+		// EXECUTING is LEGITIMATELY in flight (e.g. the
+		// slash command's `withSession` is mid-write) and
+		// must NOT be touched. The reconcile call NEVER
+		// invokes `ctx.newSession()`; it only writes
+		// EXECUTING -> COMPLETE / FAILED transitions through
+		// the S04 store.
+		if (startReason === "startup") {
+			try {
+				reconcileInterruptedRollovers({
+					projectId: initial.projectId,
+					oldSessionId: initial.oldSessionId,
+					store: getStore(),
+					jsonlScanner: reconcileScanner,
+					sink: reconcileSink,
+				});
+			} catch {
+				// The reconciler is bounded: its own outer
+				// try/catch converts exceptions into a
+				// diagnostic. Anything that escapes here is a
+				// programmer error; swallow it so the
+				// session_start pipeline completes.
+			}
+		}
 		// S05A: a new (project, session) starts with a fresh
 		// pressure-trigger machine. Any prior machine for this
 		// exact key is reset; machines for prior keys are
@@ -462,9 +511,7 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 			} catch (err) {
 				if (pmForPrepare !== null && a.reason === "PRESSURE") {
 					const failure_code =
-						err instanceof RolloverOrchestratorError
-							? err.failure_code
-							: "unknown";
+						err instanceof RolloverOrchestratorError ? err.failure_code : "unknown";
 					pmForPrepare.applyPrepareOutcome(
 						classifyPrepareOutcome({ ok: false, failure_code }),
 					);
@@ -472,9 +519,7 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 				throw err;
 			}
 			if (pmForPrepare !== null && a.reason === "PRESSURE") {
-				pmForPrepare.applyPrepareOutcome(
-					classifyPrepareOutcome({ ok: true }),
-				);
+				pmForPrepare.applyPrepareOutcome(classifyPrepareOutcome({ ok: true }));
 			}
 			return {
 				content: [
@@ -599,6 +644,22 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 				reply(`Rollover ${id} is in state ${request.state}; cannot execute.`);
 				return;
 			}
+			const runtimeCompatibility = classifyPiRuntimeCompatibility(
+				runtimeVersion ?? detectPiRuntimeVersion(),
+				validatedSafeVersions,
+			);
+			if (runtimeCompatibility.classification !== "SAFE") {
+				const reason = runtimeCompatibility.classification === "KNOWN_UNSAFE"
+					? "KNOWN_UNSAFE Pi runtime"
+					: "UNVALIDATED Pi runtime";
+				reply(
+					`PICM refused rollover before EXECUTING: ${reason} ` +
+					`${runtimeCompatibility.version} (${runtimeCompatibility.code}). ` +
+					`The public newSession path can terminate during runtime rebind before ` +
+					`withSession runs; use native fallback until a fixed Pi version is verified.`,
+				);
+				return;
+			}
 			// Move to EXECUTING.
 			store.rollovers.transition({
 				projectId,
@@ -662,11 +723,85 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 						to: "COMPLETE",
 						newSessionId,
 					});
-					// Kick the new session off on the structured
-					// handoff.
-					await freshCtx.sendUserMessage(
+					// P03 corrective: `freshCtx.sendUserMessage`
+					// awaits the new session's full agent turn
+					// (prompt -> LLM -> response). Awaiting it
+					// inside `withSession` blocked the old
+					// slash command's `await ctx.newSession()`
+					// indefinitely, and on rate-limited models
+					// the old TUI was held hostage while the
+					// new TUI tried to render in the same PTY.
+					// The handoff itself is already persisted as
+					// the first user message in the new session
+					// by `setup` above; `sendUserMessage` here
+					// is only the kickoff prompt that asks the
+					// new agent to begin work on the handoff.
+					// Fire it without awaiting; attach a
+					// bounded error logger so failures are
+					// visible (NOT silent). Rollover state is
+					// already COMPLETE — the new session was
+					// successfully created, the handoff is
+					// durable, and a kickoff failure is
+					// recoverable by the user re-submitting.
+					const kickoff = freshCtx.sendUserMessage(
 						`Continuing ${ho.work_package}. ${hydration.text.split("\n")[0]}`,
 					);
+					kickoff.catch((err: unknown) => {
+						// ponytail: best-effort kickoff logger.
+						// The new session is fully active at
+						// the point this catch runs (the old
+						// session is invalidated and the new
+						// TUI is bound). We surface the error
+						// through the replaced context's
+						// public UI: a notification in the new
+						// TUI is observable, and Pi itself
+						// will not crash on a notify call.
+						// SAFETY: `ui` is a public getter on
+						// the replaced context (see Pi's
+						// `ExtensionRunner.createContext`,
+						// which is re-used by
+						// `createReplacedSessionContext`).
+						// `hasUI` is a guarded check; the
+						// runner's `assertActive()` runs on
+						// every access and is valid because
+						// the new session is the active
+						// runner at the time this catch
+						// fires. If `hasUI` is false, the
+						// notify is silently skipped.
+						const message = err instanceof Error ? err.message : String(err);
+						try {
+							// SAFETY: `ui` and `hasUI` are public
+							// members of the replaced context's
+							// underlying ExtensionContext (Pi's
+							// `runner.createContext` at
+							// `dist/core/extensions/runner.js`).
+							// The re-type only narrows the public
+							// shape to the methods we actually
+							// call, and the chained `try` plus
+							// `hasUI?.()` guard short-circuits if
+							// either is unavailable.
+							const ui = freshCtx as unknown as {
+								hasUI?: () => boolean;
+								ui?: {
+									notify?: (text: string, level: "info" | "warning" | "error") => void;
+								};
+							};
+							if (ui.hasUI?.() && ui.ui?.notify) {
+								ui.ui.notify(
+									`PICM rollover kickoff failed (new session is ready, handoff persisted): ${message}`,
+									"warning",
+								);
+							}
+						} catch {
+							// The notification itself failed
+							// (e.g. the new session was torn
+							// down before the catch fired).
+							// The new session file is durable
+							// and the user can re-submit the
+							// kickoff message; nothing more
+							// we can do here.
+						}
+					});
 				},
 			});
 			if (result.cancelled) {

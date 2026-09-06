@@ -69,7 +69,7 @@ export { RECOVERY_TOOL_NAME };
  * Default export. Wired as a Pi extension entrypoint per
  * `pi.extensions` in package.json.
  */
-export default function cmv3Extension(pi: ExtensionAPI): void;
+export default function cmv3Extension(pi: ExtensionAPI, runtimeVersion?: string, validatedSafeVersions?: readonly string[]): void;
 export { RECOVERY_TOOL_NAME as PICM_RECOVER_TOOL_NAME } from "./recovery-tool.js";
 export { LIVE_TOOL_RESULT_HOOK_NAME } from "./tool-result-live.js";
 export type { ContextProfile } from "../core/profiles.js";
