@@ -789,7 +789,17 @@ describe("SECURITY 31: filenames contain no command/payload/project path", () =>
 		// The dir name is the opaque id, nothing else.
 		assert.match(out.id, /^[a-z0-9_-]{8,128}$/);
 		assert.equal(out.id.includes("exec"), false);
-		assert.equal(out.id.includes("x"), false);
+		// P01 corrective flake-fix: the previous assertion
+		// was `out.id.includes("x")` which is unsatisfiable
+		// because `x` is in the `[a-z0-9_-]` id alphabet —
+		// the test was passing by chance when the random id
+		// didn't include an `x`. We assert the actual two-byte
+		// payload sequence (the same approach as SECURITY 30).
+		assert.equal(
+			out.id.includes("x\n"),
+			false,
+			"id must not embed the payload sequence",
+		);
 	});
 });
 

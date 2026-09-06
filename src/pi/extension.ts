@@ -44,6 +44,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 
 import { openStore, type Cmv3Store } from "../store/index.js";
+import { generateId } from "../store/ids.js";
 import {
 	buildHydrationPayload,
 	createRolloverOrchestrator,
@@ -390,7 +391,17 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 			const now = new Date().toISOString();
 			const cp = {
 				schema_version: "1.0.0" as const,
-				checkpoint_id: "",
+				// P01 corrective: the S04 orchestrator
+				// validates the checkpoint and projects the
+				// handoff before persisting. The store
+				// rewrites checkpoint_id on write, so the
+				// only requirement here is a non-empty
+				// placeholder that satisfies
+				// `requireString(c, "checkpoint_id", ...)`.
+				// An empty string failed the live
+				// `picm_prepare_rollover` tool path that
+				// no unit test had exercised before P01.
+				checkpoint_id: generateId(),
 				project_id: projectId,
 				session_id: oldSessionId,
 				created_at: now,
@@ -613,6 +624,23 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 					const newSessionFile = freshCtx.sessionManager.getSessionFile();
 					const newSessionId = newSessionFile ?? "new-session";
 					const ts = new Date().toISOString();
+					// P01 corrective: `oldSessionId` is set
+					// by `session_start` from the runtime's
+					// session-file getter, which in real Pi is
+					// a session file path (e.g. `sess_xxx.json`).
+					// A file path cannot be embedded in a
+					// `cmv3://session/<id>` ref — the store
+					// rejects it as malformed. Normalize to a
+					// ref-shaped id by stripping the directory
+					// and extension. If the result is empty
+					// (which only happens for the synthetic
+					// `current` sentinel), fall back to null.
+					const oldSessionBasename = oldSessionId.split("/").pop() ?? "";
+					const oldSessionIdBare = oldSessionBasename.replace(/\.json$/, "");
+					const previous_session_ref =
+						oldSessionIdBare.length === 0 || oldSessionIdBare === "current"
+							? null
+							: `cmv3://session/${oldSessionIdBare}`;
 					// Persist a new session record.
 					store.sessions.write(
 						{
@@ -623,8 +651,7 @@ export default function cmv3Extension(pi: ExtensionAPI): void {
 							status: "OPEN",
 							checkpoint_refs: [request.checkpoint_ref],
 							handoff_refs: [request.handoff_ref],
-							previous_session_ref:
-								oldSessionId === "current" ? null : `cmv3://session/${oldSessionId}`,
+							previous_session_ref,
 							next_session_ref: null,
 						},
 						{ projectId },

@@ -2191,3 +2191,128 @@ describe("S05A SM 12: no infinite settled → sendMessage loop", () => {
 		assert.equal(sends, 2);
 	});
 });
+
+/* -------------------------------------------------------------------- *
+ * P01 REGRESSION: the live picm_prepare_rollover tool was untested     *
+ * through the real extension entry. P01 found that the prepare path   *
+ * passed `checkpoint_id: ""` to `projectHandoffFromCheckpoint`, which  *
+ * threw "checkpoint_id must be a non-empty string". The fix: stamp a  *
+ * placeholder id before the handoff projection; the store rewrites it *
+ * on write. This test exercises the full live tool path end-to-end.  *
+ * -------------------------------------------------------------------- */
+
+describe("P01 REGRESSION: live picm_prepare_rollover works end-to-end", () => {
+	it("the registered tool returns a non-empty rollover ref for NATURAL", async () => {
+		const prevMode = process.env["CMV3_MODE"];
+		const prevStore = process.env["CMV3_STORE_PATH"];
+		process.env["CMV3_MODE"] = "v3";
+		try {
+			// Use a stable seed string for the cwd; the
+			// extension derives the projectId from cwd, so
+			// the test must use the same seed in both places.
+			const seed = `git@github.com:example/s05-p01-prepare-regression-${randomBytes(2).toString("hex")}.git`;
+			const projectId = projectIdFromSeed(seed);
+			const root = join(
+				tmpdir(),
+				`cmv3-s05a-p01-regression-${process.pid}-${Date.now()}-${randomBytes(4).toString("hex")}`,
+			);
+			mkdirSync(root, { recursive: true, mode: 0o700 });
+			// The live extension opens its own store from
+			// `CMV3_STORE_PATH`; point it at the same root we
+			// use for assertions so both share the durable
+			// surface.
+			process.env["CMV3_STORE_PATH"] = root;
+			const s = openStore({ storagePath: root });
+			// Build a synthetic extension-API stub that
+			// points the live extension at our store.
+			const captured: Record<string, ((event: unknown) => unknown)[]> = {};
+			const toolCaptured: {
+				name: string;
+				execute: (id: string, args: unknown) => unknown;
+			}[] = [];
+			const stub = {
+				on(event: string, handler: (event: unknown) => unknown) {
+					(captured[event] ??= []).push(handler);
+				},
+				registerTool(t: {
+					name: string;
+					execute: (id: string, args: unknown) => unknown;
+				}) {
+					toolCaptured.push(t);
+				},
+				registerCommand() {
+					/* not used here */
+				},
+				sendMessage() {
+					/* not used here */
+				},
+			};
+			cmv3Extension(
+				stub as unknown as Parameters<typeof cmv3Extension>[0],
+			);
+			// Drive session_start so currentProjectId /
+			// currentSessionId are populated. The extension
+			// derives projectId from ctx.cwd via
+			// `projectIdFromSeed(cwd)`; pass the same seed.
+			const ssHandler = captured["session_start"]?.[0];
+			assert.ok(ssHandler);
+			const ctx = {
+				cwd: seed,
+				sessionManager: { getSessionFile: () => "synthetic.json" },
+				getContextUsage: () => ({
+					tokens: null as number | null,
+					contextWindow: 32768,
+				}),
+			} as unknown as Parameters<typeof ssHandler>[1];
+			await (ssHandler as (e: unknown, c: unknown) => Promise<unknown>)(
+				{ cwd: seed },
+				ctx,
+			);
+			// Invoke the registered picm_prepare_rollover.
+			const prepare = toolCaptured.find(
+				(t) => t.name === "picm_prepare_rollover",
+			);
+			assert.ok(prepare);
+			const out = (await prepare!.execute("p01-prepare-call", {
+				reason: "NATURAL",
+				goal: "P01 regression goal",
+				work_package: "P01: regression test work package",
+				status: "COMPLETE",
+				completed: ["one thing done"],
+				in_progress: [],
+				blockers: [],
+				important_decisions: ["a decision"],
+				hard_constraints: ["a constraint"],
+				current_files: ["src/x.ts"],
+				active_errors: [],
+				next_actions: ["next thing"],
+				recovery_refs: [],
+			})) as {
+				content: { type: string; text: string }[];
+				details: { ref: string; id: string; state: string };
+			};
+			// Before the fix this threw
+			// "validateCheckpoint: checkpoint_id must be a
+			// non-empty string".
+			assert.ok(out.details.ref.startsWith("cmv3://rollover/"));
+			assert.ok(out.details.id.length >= 8);
+			assert.equal(out.details.state, "READY");
+			// The store should have a corresponding
+			// checkpoint + handoff + rollover.
+			assert.ok(s.checkpoints.list(projectId).length >= 1);
+			assert.ok(s.handoffs.list(projectId).length >= 1);
+			assert.ok(s.rollovers.list(projectId).length >= 1);
+		} finally {
+			if (prevMode === undefined) {
+				delete process.env["CMV3_MODE"];
+			} else {
+				process.env["CMV3_MODE"] = prevMode;
+			}
+			if (prevStore === undefined) {
+				delete process.env["CMV3_STORE_PATH"];
+			} else {
+				process.env["CMV3_STORE_PATH"] = prevStore;
+			}
+		}
+	});
+});
