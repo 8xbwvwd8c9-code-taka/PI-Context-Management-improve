@@ -90,6 +90,24 @@ if (!pkg.pi) {
 			}
 		}
 	}
+
+	// Hard gate for the V101 packaging fix: the canonical Git
+	// install MUST already contain the runtime extension on disk.
+	// Pi Git packages may install without devDependencies, so a
+	// prepare script that depends on TypeScript is NOT sufficient.
+	// The committed dist/ artifact is the source of truth for
+	// Git-install compatibility.
+	for (const entry of pkg.pi.extensions) {
+		const rel = String(entry).replace(/^\.\//, "");
+		if (!existsSync(join(root, rel))) {
+			fail(
+				`Git-install guard: extension entry ${entry} is not present in the repository working tree. ` +
+					`Commit the build artifact (dist/) so a clean Git clone is runtime-ready without manual build.`,
+			);
+		} else {
+			ok(`Git-install guard: ${entry} present in working tree`);
+		}
+	}
 	if (!Array.isArray(pkg.pi.skills) || pkg.pi.skills.length === 0) {
 		fail("package.json: `pi.skills` must be a non-empty array");
 	} else {
@@ -126,6 +144,53 @@ if (!pkg.pi) {
 	}
 }
 
+// V101 packaging gate — every `files` entry must actually exist
+// on disk. Without this, an operator can ship a package whose
+// `files: ["dist", ...]` lists a directory whose build artifact
+// was never committed. That's exactly the V101 defect class.
+for (const f of shippedFiles) {
+	const p = join(root, String(f).replace(/^\.\//, ""));
+	if (!existsSync(p)) {
+		fail(`shipped files entry missing on disk: ${p}`);
+	} else {
+		ok(`shipped files entry present: ${p}`);
+	}
+}
+
+// V101 packaging gate — `main` must resolve to a real file. A
+// missing main is a build-artifact forget (i.e. forgot to commit
+// dist/) caught at the package surface.
+if (typeof pkg.main === "string" && pkg.main.length > 0) {
+	const mainPath = join(root, pkg.main.replace(/^\.\//, ""));
+	if (!existsSync(mainPath)) {
+		fail(`package.json main missing: ${mainPath}`);
+	} else {
+		ok(`package main present: ${mainPath}`);
+	}
+}
+
+// V101 packaging gate — every `exports` runtime path (the
+// `import` targets, plus the `types` targets) must resolve to a
+// real file. types-only entries are checked for sidecar `.d.ts`
+// files when the `.ts` source is the source of truth, but for the
+// build-output pattern we expect compiled artifacts.
+if (pkg.exports && typeof pkg.exports === "object") {
+	for (const [subpath, def] of Object.entries(pkg.exports)) {
+		if (!def || typeof def !== "object") continue;
+		const targets = [def.import, def.require, def.default].filter(
+			(t) => typeof t === "string",
+		);
+		for (const t of targets) {
+			const p = join(root, String(t).replace(/^\.\//, ""));
+			if (!existsSync(p)) {
+				fail(`package exports[${subpath}] target missing: ${p}`);
+			} else {
+				ok(`package exports[${subpath}] target present: ${p}`);
+			}
+		}
+	}
+}
+
 if (pkg.private === true) {
 	ok("package.json: `private: true`");
 } else {
@@ -138,6 +203,44 @@ if (!pkg.peerDependencies || !pkg.peerDependencies["@earendil-works/pi-coding-ag
 	);
 } else {
 	ok("peerDependency: @earendil-works/pi-coding-agent");
+}
+
+// V101 packaging gate — version alignment between package.json,
+// package-lock.json root, and package-lock.json packages[""]. All
+// three must agree so a published or Git-cloned package has a
+// single source-of-truth version. A drift here is the kind of
+// bug that npm install masks but real installs expose.
+{
+	const pkgVer = pkg.version;
+	const lockPath = join(root, "package-lock.json");
+	if (!existsSync(lockPath)) {
+		fail("package-lock.json missing");
+	} else {
+		let lock;
+		try {
+			lock = JSON.parse(readFileSync(lockPath, "utf8"));
+		} catch (err) {
+			fail(`package-lock.json is not valid JSON: ${err.message}`);
+		}
+		if (lock) {
+			const lockVer = lock.version;
+			const lockRootVer = lock.packages && lock.packages[""] && lock.packages[""].version;
+			if (lockVer !== pkgVer) {
+				fail(
+					`version drift: package.json version=${pkgVer} vs package-lock.json version=${lockVer}`,
+				);
+			} else {
+				ok(`version aligned: package.json ↔ package-lock.json root (${pkgVer})`);
+			}
+			if (lockRootVer !== pkgVer) {
+				fail(
+					`version drift: package.json version=${pkgVer} vs package-lock.json packages[""].version=${lockRootVer}`,
+				);
+			} else {
+				ok(`version aligned: package.json ↔ package-lock.json packages[""] (${pkgVer})`);
+			}
+		}
+	}
 }
 
 const allDeps = [

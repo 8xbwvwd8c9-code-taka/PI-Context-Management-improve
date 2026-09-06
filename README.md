@@ -25,7 +25,7 @@ Validated capabilities include:
 - no Pi core patches
 - no automatic Git mutation
 
-Final v1.0 validation completed with **345 passing tests** across unit, integration, controlled runtime, packaging, and portability coverage.
+Final v1.0 validation completed with **355 passing tests** across unit, integration, controlled runtime, packaging, and portability coverage.
 
 Package publication and repository tagging may still be pending.
 
@@ -267,15 +267,17 @@ Project-specific behavior, if ever required, belongs behind adapters rather than
 Current version:
 
 ```text
-1.0.0
+1.0.1
 ```
+
+PICM v1.0.1 is a packaging corrective over v1.0: the build artifact (`dist/`) is now committed, so a clean `pi install https://github.com/8xbwvwd8c9-code-taka/PI-Context-Management-improve` is runtime-ready without any manual `npm install` / `npm run build` step.
 
 The package exposes both:
 
 - the standalone `context-management` Skill
 - the Pi Runtime Extension
 
-The v1.0 package has passed same-artifact cross-project installation and smoke validation.
+The v1.0.1 package has passed same-artifact cross-project installation and smoke validation, including a clean Git-install gate that loads the extension from the committed `dist/`.
 
 Public package publication may still be pending.
 

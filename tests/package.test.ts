@@ -91,6 +91,112 @@ describe("package: metadata is valid (test 5)", () => {
 	});
 });
 
+// V101 packaging regression tests. The original defect was that
+// `dist/` was gitignored while `pi.extensions` pointed into it.
+// A clean Git clone therefore could not load the extension
+// without `npm install --include=dev && npm run build`. These
+// tests lock the corrected state so the defect cannot recur
+// silently.
+describe("package V101: Git-install guard", () => {
+	it("every pi.extensions entry resolves to an on-disk file in the working tree", () => {
+		const pkg = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8"));
+		const exts: string[] = pkg.pi.extensions ?? [];
+		assert.ok(exts.length > 0, "must have at least one extension");
+		for (const entry of exts) {
+			const rel = String(entry).replace(/^\.\//, "");
+			const p = join(REPO_ROOT, rel);
+			assert.ok(
+				existsSync(p),
+				`extension entry must be present in the working tree (V101 defect guard): ${entry}`,
+			);
+		}
+	});
+	it("every pi.skills entry resolves to an on-disk directory in the working tree", () => {
+		const pkg = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8"));
+		const skills: string[] = pkg.pi.skills ?? [];
+		assert.ok(skills.length > 0, "must have at least one skill");
+		for (const entry of skills) {
+			const rel = String(entry).replace(/^\.\//, "");
+			const p = join(REPO_ROOT, rel);
+			assert.ok(
+				existsSync(p),
+				`skill entry must be present in the working tree: ${entry}`,
+			);
+		}
+	});
+	it("the runtime extension file is committed on disk (the V101 hard gate)", () => {
+		// The original V101 defect shipped a package whose
+		// `pi.extensions = ["./dist/pi/extension.js"]` while
+		// `dist/` was gitignored. A clean clone therefore had no
+		// runtime extension. This test enforces the corrected
+		// invariant: the file referenced by the very first
+		// `pi.extensions` entry must exist on disk right now,
+		// without any build step.
+		const pkg = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8"));
+		const firstExt = String(pkg.pi.extensions[0]).replace(/^\.\//, "");
+		const p = join(REPO_ROOT, firstExt);
+		assert.ok(existsSync(p), `must exist on disk for clean Git install: ${p}`);
+	});
+});
+
+describe("package V101: dist/ is shipped (no manual build on Git install)", () => {
+	it("dist/ is not gitignored (committed build artifact)", () => {
+		const gi = readFileSync(join(REPO_ROOT, ".gitignore"), "utf8");
+		// A line that is exactly `dist/` or starts with `dist/`
+		// followed by a comment or end-of-line. We reject both.
+		const lines = gi.split(/\r?\n/);
+		for (const line of lines) {
+			const trimmed = line.trim();
+			if (trimmed === "dist/" || trimmed === "dist") {
+				throw new Error(
+					`.gitignore must not ignore dist/ (V101 packaging fix): \`${trimmed}\``,
+				);
+			}
+		}
+	});
+	it("dist/index.js exists (package main is shipped)", () => {
+		assert.ok(existsSync(join(REPO_ROOT, "dist", "index.js")));
+	});
+	it("dist/pi/extension.js exists (the runtime extension entry)", () => {
+		assert.ok(existsSync(join(REPO_ROOT, "dist", "pi", "extension.js")));
+	});
+	it("package main in package.json points to a file present on disk", () => {
+		const pkg = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8"));
+		assert.equal(typeof pkg.main, "string");
+		const mainPath = join(REPO_ROOT, String(pkg.main).replace(/^\.\//, ""));
+		assert.ok(existsSync(mainPath), `package main must exist: ${mainPath}`);
+	});
+	it("every package exports[import] target is present on disk", () => {
+		const pkg = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8"));
+		const exports = pkg.exports ?? {};
+		for (const [subpath, def] of Object.entries(exports)) {
+			if (!def || typeof def !== "object") continue;
+			const importTarget = (def as Record<string, unknown>).import;
+			if (typeof importTarget !== "string") continue;
+			const p = join(REPO_ROOT, importTarget.replace(/^\.\//, ""));
+			assert.ok(
+				existsSync(p),
+				`exports[${subpath}].import target must exist on disk: ${p}`,
+			);
+		}
+	});
+});
+
+describe("package V101: version alignment", () => {
+	it("package.json, package-lock.json root, and packages[''].version agree", () => {
+		const pkg = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8"));
+		const lock = JSON.parse(
+			readFileSync(join(REPO_ROOT, "package-lock.json"), "utf8"),
+		);
+		assert.equal(lock.version, pkg.version);
+		assert.equal(lock.packages[""].version, pkg.version);
+	});
+	it("PACKAGE_VERSION constant in extension source matches package.json", () => {
+		const pkg = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8"));
+		assert.equal(PACKAGE_VERSION, pkg.version);
+	});
+});
+
 describe("config: default mode = legacy (test 29)", () => {
 	it("DEFAULT_MODE is legacy", () => {
 		assert.equal(DEFAULT_MODE, "legacy");

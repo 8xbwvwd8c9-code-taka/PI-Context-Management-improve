@@ -1,6 +1,6 @@
 {
   "name": "pi-context-management-improve",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Portable Pi context-management package (CMV3). Long-running task continuity with small active context, durable checkpoints, fresh-session rollover, and recoverable tool-result history. Local 32K first-class. Project-independent.",
   "type": "module",
   "main": "./dist/index.js",

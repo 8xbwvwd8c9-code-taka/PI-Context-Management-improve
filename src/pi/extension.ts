@@ -83,7 +83,7 @@ import {
 
 /** Package identity. Mirrored from package.json for runtime introspection. */
 export const PACKAGE_NAME = "pi-context-management-improve";
-export const PACKAGE_VERSION = "1.0.0";
+export const PACKAGE_VERSION = "1.0.1";
 export const PACKAGE_PHASE = "P02-CROSS-PROJECT-PORTABILITY-V1";
 
 /**
