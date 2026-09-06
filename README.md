@@ -21,70 +21,59 @@ project state as external, recoverable storage.
 
 ## Status
 
-**S04 — fresh-session rollover**
+**PICM v1.0** — cross-project portability validated.
 
-This package is currently in development. It is **not published**
-to npm. It is intended to be installed from this repository once
-the live integration lands in S05.
+PICM v1 is the first stable release. It is the same packaged
+artifact, loaded from the same tarball, that drives the
+P02 cross-project portability validation: one Node Git
+target plus one non-Git Python target, both consuming the
+same install, both with zero project-specific PICM
+configuration, both with isolated stores and isolated
+project ids.
 
-S04 adds safe fresh-session rollover on top of S03:
+PICM v1 ships:
 
-- the agent-callable `picm_prepare_rollover` tool (returns an
-  opaque rollover request id)
-- the `/picm-rollover-execute <opaque-id>` command (owns the
-  `ctx.newSession` call)
-- the deterministic `agent_settled` pressure observer
-- the `RolloverRequest` durable record with state machine
-  (PREPARING → READY → EXECUTING → COMPLETE / FAILED / CANCELLED)
-- the pre-NEW hard gate (9 checks, blocks newSession on any
-  failure)
-- the in-process lock that prevents two concurrent
-  `picm_prepare_rollover` calls for the same project+session
-- a structured hydration payload that contains ONLY the
-  MinimalHandoff projection (no transcript, no raw tool output,
-  no full checkpoint)
-- the strict `v3 / v3-observe / legacy` mode semantics
-- the S03 tool-result store, available via `recovery_refs` in
-  the handoff
-
-S04 does NOT yet:
-
-- intercept live Pi tool output automatically (S05+)
-- implement semantic / vector history search
-- introduce a database dependency
-- mutate the user's Git state
-- call `ctx.compact()`
-
-Prior WPs:
-
-- portable Pi Skill + Extension package (S01)
+- a portable Skill + Extension package (S01)
 - local 32K models as a first-class runtime (S01 profiles)
 - durable checkpoint / handoff / session persistence (S02)
 - deterministic recovery without LLM (S02)
-- tool-result virtualization (S03, current)
+- tool-result virtualization (S03)
 - natural rollover at work-package boundaries (S04)
 - pressure rollover for long unfinished work (S04)
-- deterministic cleanup before LLM compaction (post-S04)
-- native Pi compaction retained as emergency fallback (always)
+- live Pi runtime integration (S05): `session_start`,
+  `tool_result`, `agent_settled`, `picm_recover`
+- cross-project portability validated (P01, P02)
+
+PICM v1 does NOT:
+
+- introduce a database dependency
+- mutate the user's Git state
+- call `ctx.compact()`
+- require project-specific configuration
+- ship any host-project identifiers in the public surface
+- pollute target repositories with copied PICM source
 
 ## Installation
 
-**Not yet published.** S01 is a local-development skeleton.
-
-When the package is published, the expected install command is:
+PICM v1 is a local-development artifact validated end-to-end
+through P02. It is **not published** to npm. The expected
+install command, once published, is:
 
 ```text
 pi install npm:pi-context-management-improve
 ```
 
-For now, you can point Pi at the local checkout:
+For local development, you can point Pi at the source tree:
 
 ```text
 pi -e /path/to/PI-Context-Management-improve
 ```
 
 Or copy the package under `~/.pi/agent/npm/` and add it to your
-`settings.json` `packages` list.
+`settings.json` `packages` list. The P02 cross-project
+portability validation proves that the same packaged artifact
+works in any target project without source copies or
+project-specific configuration.
 
 ## Architecture
 
@@ -100,10 +89,11 @@ PICM
 The Portable Core is pure / deterministic. No Pi, no host project,
 no I/O outside the package's own working area.
 
-The Pi Runtime Extension hosts lifecycle hooks, telemetry,
-tool-result interception, checkpoint trigger, and fresh-session
-rollover. Through S03, the extension remains a no-op entrypoint;
-live hook wiring is deferred to S04+.
+The Pi Runtime Extension hosts lifecycle hooks, tool-result
+virtualization, agent_settled pressure observer, the recovery
+tool, and fresh-session rollover. The extension is wired to
+the live Pi runtime in S05; the S04 orchestrator owns the
+`ctx.newSession` call.
 
 The Durable Store (S02 + S03) is a local-first filesystem library.
 It lives outside the target Git repo by default and is responsible
@@ -165,28 +155,34 @@ npm run build
 npm run package:check
 ```
 
-## Non-goals (S01)
+## Non-goals (v1)
 
-- no live context inspection
-- no tool interception
-- no checkpoint persistence
-- no rollover
-- no native-compaction calls
-- no live Pi config changes
-- no npm publish
+- no host-project identifiers in the public surface
+- no database dependency
+- no semantic / vector history search
+- no automatic LLM-driven cleanup outside the deterministic
+  pre-NEW gate
+- no project-specific core code (PICM does not know the name
+  of any host project)
+- no source copy into target repositories
 
 ## Roadmap
 
 | WP | Status | Goal |
 | --- | --- | --- |
-| R01 — research / provenance | ✅ | External repository assimilation + license classification |
-| R02 — architecture freeze | ✅ | Frozen contracts: profiles, pressure, checkpoint, handoff, ref, tool-result, storage, modes |
-| S01 — portable package skeleton | ✅ | Combined Skill + Extension package, portable core, schemas, tests |
+| R01 — research / provenance | done | External repository assimilation + license classification |
+| R02 — architecture freeze | done | Frozen contracts: profiles, pressure, checkpoint, handoff, ref, tool-result, storage, modes |
+| S01 — portable package skeleton | done | Combined Skill + Extension package, portable core, schemas, tests |
 | S02 — checkpoint / handoff / history | done | Durable store: checkpoints, handoffs, sessions, project metadata, history, recovery |
 | S03 — tool-result virtualization | done | Refs-backed tool result durability, integrity verification, bounded active view, on-demand recovery |
-| **S04 — fresh-session rollover** | **current** | Natural + pressure rollover orchestrator, deterministic state machine, pre-NEW hard gate, structured hydration, mode-gated |
-| P01 — pilot 1 | planned | First portability acceptance test (separate downstream project) |
-| P02 — pilot 2 | planned | Second portability acceptance test (separate downstream project) |
+| S04 — fresh-session rollover | done | Natural + pressure rollover orchestrator, deterministic state machine, pre-NEW hard gate, structured hydration, mode-gated |
+| S05 — live runtime integration | done | Wire S03/S04 to Pi runtime lifecycle hooks (session_start, tool_result, agent_settled), additive over S04 |
+| P01 — portability pilot | done | First portability acceptance test (controlled runtime pilot) |
+| P02 — cross-project portability | done | Final v1 portability gate: same packaged artifact in two unrelated projects (Git + non-Git) |
+
+PICM v1 is complete. The same packaged tarball (v1.0.0) drives
+the live Pi runtime, durable store, project adapters, and
+cross-project portability without target-specific core code.
 
 ## Authoritative documents
 
@@ -200,4 +196,4 @@ npm run package:check
 
 ## License
 
-MIT (private during S04; license declared in `package.json`).
+MIT (declared in `package.json`).

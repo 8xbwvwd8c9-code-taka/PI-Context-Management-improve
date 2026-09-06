@@ -42,19 +42,52 @@ if (!existsSync(pkgPath)) {
 	fail("package.json missing");
 	process.exit(1);
 }
-const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+let pkg;
+try {
+	pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+} catch (err) {
+	fail(`package.json is not valid JSON: ${err.message}`);
+	process.exit(1);
+}
 
-if (!pkg.pi) fail("package.json: missing `pi` block");
-else {
+// Files that ship inside the packed tarball. Every
+// `pi.extensions` / `pi.skills` entry MUST live under one of
+// these prefixes; otherwise the packed install cannot load it.
+const shippedFiles = Array.isArray(pkg.files) ? pkg.files : [];
+const shippedPrefixes = shippedFiles.map((f) =>
+	String(f).replace(/\/+$/, "").replace(/^\.\//, ""),
+);
+function isUnderShipped(rel) {
+	const r = String(rel).replace(/^\.\//, "").replace(/\/+$/, "");
+	for (const pref of shippedPrefixes) {
+		if (r === pref || r.startsWith(`${pref}/`)) return true;
+	}
+	return false;
+}
+
+if (!pkg.pi) {
+	fail("package.json: missing `pi` block");
+} else {
 	if (!Array.isArray(pkg.pi.extensions) || pkg.pi.extensions.length === 0) {
 		fail("package.json: `pi.extensions` must be a non-empty array");
 	} else {
 		ok(`pi.extensions = ${JSON.stringify(pkg.pi.extensions)}`);
 		for (const entry of pkg.pi.extensions) {
 			const p = join(root, String(entry).replace(/^\.\//, ""));
-			if (!existsSync(p)) fail(`extension entry missing: ${p}`);
-			else if (!statSync(p).isFile()) fail(`extension entry is not a file: ${p}`);
-			else ok(`extension entry exists: ${p}`);
+			if (!existsSync(p)) {
+				fail(`extension entry missing: ${p}`);
+			} else if (!statSync(p).isFile()) {
+				fail(`extension entry is not a file: ${p}`);
+			} else {
+				ok(`extension entry exists: ${p}`);
+			}
+			if (!isUnderShipped(String(entry))) {
+				fail(
+					`extension entry ${entry} is not under a shipped directory (files: ${JSON.stringify(shippedFiles)})`,
+				);
+			} else {
+				ok(`extension entry ships in package: ${entry}`);
+			}
 		}
 	}
 	if (!Array.isArray(pkg.pi.skills) || pkg.pi.skills.length === 0) {
@@ -82,14 +115,21 @@ else {
 					ok(`reference ${ref} OK`);
 				}
 			}
+			if (!isUnderShipped(String(entry))) {
+				fail(
+					`skill entry ${entry} is not under a shipped directory (files: ${JSON.stringify(shippedFiles)})`,
+				);
+			} else {
+				ok(`skill entry ships in package: ${entry}`);
+			}
 		}
 	}
 }
 
-if (pkg.private !== true) {
-	fail("package.json: must be `private: true` for S01 (no npm publish yet)");
-} else {
+if (pkg.private === true) {
 	ok("package.json: `private: true`");
+} else {
+	fail("package.json: must be `private: true` for S01 (no npm publish yet)");
 }
 
 if (!pkg.peerDependencies || !pkg.peerDependencies["@earendil-works/pi-coding-agent"]) {

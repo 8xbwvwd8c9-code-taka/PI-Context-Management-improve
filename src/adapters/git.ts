@@ -46,7 +46,10 @@ export function discoverGitProject(root: string): ProjectInfo {
 	}
 
 	const head = readRefOrNull(join(gitDir, "HEAD"));
-	const { branch, headSha } = parseHead(head);
+	const { branch, headSha: detachedSha } = parseHead(head);
+	// When HEAD points at a branch, the SHA is the branch ref.
+	const headSha =
+		detachedSha ?? (branch !== null ? readRefOrNull(join(gitDir, "refs", "heads", branch)) : null);
 
 	const origin = readOriginUrl(join(gitDir, "config"));
 	const indexPath = join(gitDir, "index");

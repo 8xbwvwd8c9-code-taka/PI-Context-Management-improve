@@ -5,10 +5,10 @@
 ## Environment
 
 - PI_VERSION: `0.85.1`
-- PICM_COMMIT: `8db2f3e`
+- PICM_COMMIT: `f5d869a`
 - PILOT_PROFILE: local_32k (default) + tiny (pressure)
 - PILOT_PROJECT_KIND: synthetic-git-repo
-- Pilot repo (disposable): `/var/folders/qr/g6jgm76s0nq740t4wl9yffxc0000gn/T/p01-pilot-repo-9737-1788676756280-401a75ad`
+- Pilot repo (disposable): `/var/folders/qr/g6jgm76s0nq740t4wl9yffxc0000gn/T/p01-pilot-repo-29749-1788678519655-41af7c2d`
 
 ## Workload
 

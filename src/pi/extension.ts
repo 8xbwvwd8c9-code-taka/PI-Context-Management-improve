@@ -83,8 +83,8 @@ import {
 
 /** Package identity. Mirrored from package.json for runtime introspection. */
 export const PACKAGE_NAME = "pi-context-management-improve";
-export const PACKAGE_VERSION = "0.1.0";
-export const PACKAGE_PHASE = "S05-LIVE-RUNTIME-INTEGRATION";
+export const PACKAGE_VERSION = "1.0.0";
+export const PACKAGE_PHASE = "P02-CROSS-PROJECT-PORTABILITY-V1";
 
 /**
  * The slash command that owns the `ctx.newSession` call. The

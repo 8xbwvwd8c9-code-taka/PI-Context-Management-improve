@@ -1223,10 +1223,10 @@ describe("END-TO-END 53: pressure → checkpoint → command → NEW → handoff
  * -------------------------------------------------------------------- */
 
 describe("S05: package identity + hook names", () => {
-	it("package identity is consistent with the S05 phase", () => {
+	it("package identity is consistent with the v1.0 phase", () => {
 		assert.equal(PACKAGE_NAME, "pi-context-management-improve");
-		assert.equal(PACKAGE_VERSION, "0.1.0");
-		assert.equal(PACKAGE_PHASE, "S05-LIVE-RUNTIME-INTEGRATION");
+		assert.equal(PACKAGE_VERSION, "1.0.0");
+		assert.equal(PACKAGE_PHASE, "P02-CROSS-PROJECT-PORTABILITY-V1");
 	});
 	it("the live hook names are non-empty stable strings", () => {
 		assert.equal(LIVE_TOOL_RESULT_HOOK_NAME, "picm-tool-result-live");

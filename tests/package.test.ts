@@ -85,9 +85,9 @@ describe("package: metadata is valid (test 5)", () => {
 		assert.equal(PACKAGE_NAME, "pi-context-management-improve");
 		assert.equal(typeof PACKAGE_VERSION, "string");
 		assert.equal(PACKAGE_VERSION.length > 0, true);
-		// S05 owns the live extension. The phase tag reflects the
-		// current capability surface.
-		assert.equal(PACKAGE_PHASE, "S05-LIVE-RUNTIME-INTEGRATION");
+		// P02 completes v1; the phase tag reflects the
+		// final portability surface.
+		assert.equal(PACKAGE_PHASE, "P02-CROSS-PROJECT-PORTABILITY-V1");
 	});
 });
 
