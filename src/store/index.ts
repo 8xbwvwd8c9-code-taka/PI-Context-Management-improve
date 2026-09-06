@@ -53,6 +53,18 @@ export {
 } from "./tool-result-store.js";
 
 export {
+	RolloverIdentityError,
+	RolloverIntegrityError,
+	RolloverTransitionError,
+	createRolloverStore,
+	rebuildRolloverIndex,
+	ROLLOVER_REF_KIND,
+	type RolloverListFilters,
+	type RolloverStore,
+	type RolloverSummary,
+} from "./rollover-store.js";
+
+export {
 	ProjectMetadataIntegrityError,
 	createProjectStore,
 	type ProjectStore,
@@ -92,6 +104,7 @@ export {
 	defaultStorePath,
 	projectDir,
 	resolveStorePath,
+	rolloverRequestPath,
 	storeLayout,
 	toolResultDir,
 	toolResultMetadataPath,

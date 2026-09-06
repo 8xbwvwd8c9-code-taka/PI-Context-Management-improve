@@ -50,6 +50,14 @@ import {
 	type ToolResultWriteOutput,
 } from "./tool-result-store.js";
 
+import {
+	createRolloverStore,
+	rebuildRolloverIndex,
+	type RolloverStore,
+	type RolloverListFilters,
+	type RolloverSummary,
+} from "./rollover-store.js";
+
 import { History, type HistoryQuery } from "./history.js";
 import {
 	recoverLatestProjectState,
@@ -64,6 +72,7 @@ export interface Cmv3Store {
 	readonly handoffs: HandoffStore;
 	readonly sessions: SessionStore;
 	readonly toolResults: ToolResultStore;
+	readonly rollovers: RolloverStore;
 	readonly projects: ProjectStore;
 	readonly history: History;
 	recover(projectId: string): ProjectRecovery;
@@ -99,6 +108,7 @@ export function openStore(options: OpenStoreOptions = {}): Cmv3Store {
 	const handoffs = createHandoffStore(layout);
 	const sessions = createSessionStore(layout);
 	const toolResults = createToolResultStore(layout);
+	const rollovers = createRolloverStore(layout);
 	const projects = createProjectStore(layout);
 	const history = new History(layout, {
 		checkpoints,
@@ -114,6 +124,7 @@ export function openStore(options: OpenStoreOptions = {}): Cmv3Store {
 		handoffs,
 		sessions,
 		toolResults,
+		rollovers,
 		projects,
 		history,
 		recover: (projectId) => recoverLatestProjectState(projects, checkpoints, handoffs, sessions, projectId),
@@ -176,6 +187,9 @@ export function rebuildAll(layout: StoreLayout, projectId: string): void {
 
 	// Tool-result index: metadata only, never the raw payload.
 	rebuildToolResultIndex(layout, projectId);
+
+	// Rollover index: per-id directory walk.
+	rebuildRolloverIndex(layout, projectId);
 }
 
 export type {
@@ -188,6 +202,9 @@ export type {
 	ToolResultWriteInput,
 	ToolResultWriteOutput,
 	ToolResultStore,
+	RolloverListFilters,
+	RolloverSummary,
+	RolloverStore,
 };
 export {
 	ToolResultAccessError,
@@ -195,3 +212,11 @@ export {
 	createToolResultStore,
 	rebuildToolResultIndex,
 } from "./tool-result-store.js";
+export {
+	RolloverIdentityError,
+	RolloverIntegrityError,
+	RolloverTransitionError,
+	createRolloverStore,
+	rebuildRolloverIndex,
+	ROLLOVER_REF_KIND,
+} from "./rollover-store.js";

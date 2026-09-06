@@ -83,6 +83,7 @@ export function projectSubpaths(): {
 	handoffs: string;
 	sessions: string;
 	toolResults: string;
+	rollovers: string;
 	index: string;
 } {
 	return {
@@ -91,6 +92,7 @@ export function projectSubpaths(): {
 		handoffs: "handoffs",
 		sessions: "sessions",
 		toolResults: "tool-results",
+		rollovers: "rollovers",
 		index: "index",
 	};
 }
@@ -114,7 +116,7 @@ export function metadataPath(layout: StoreLayout, projectId: string): string {
 export function indexPath(
 	layout: StoreLayout,
 	projectId: string,
-	kind: "checkpoints" | "handoffs" | "sessions" | "tool-results",
+	kind: "checkpoints" | "handoffs" | "sessions" | "tool-results" | "rollovers",
 ): string {
 	return join(projectDir(layout, projectId), "index", `${kind}.jsonl`);
 }
@@ -147,6 +149,25 @@ export function toolResultPayloadPath(
 	id: string,
 ): string {
 	return join(toolResultDir(layout, projectId, id), "payload.bin");
+}
+
+/**
+ * Rollover layout (S04). The RolloverRequest is a small JSON
+ * record. The directory layout (per-id directory) is used so the
+ * rollover can later carry auxiliary files (e.g. a sealed
+ * "executed" snapshot) without rewriting the historical record.
+ * Filenames contain no payload, no command body, no project path.
+ */
+export function rolloverDir(layout: StoreLayout, projectId: string, id: string): string {
+	return join(projectDir(layout, projectId), "rollovers", id);
+}
+
+export function rolloverRequestPath(
+	layout: StoreLayout,
+	projectId: string,
+	id: string,
+): string {
+	return join(rolloverDir(layout, projectId, id), "request.json");
 }
 
 /**

@@ -21,7 +21,7 @@
 
 export const REF_SCHEME = "cmv3";
 
-export type RefKind = "tool" | "checkpoint" | "session" | "file" | "handoff";
+export type RefKind = "tool" | "checkpoint" | "session" | "file" | "handoff" | "rollover";
 
 export const REF_KINDS: readonly RefKind[] = Object.freeze([
 	"tool",
@@ -29,6 +29,7 @@ export const REF_KINDS: readonly RefKind[] = Object.freeze([
 	"session",
 	"file",
 	"handoff",
+	"rollover",
 ]);
 
 /**
@@ -40,6 +41,15 @@ export const REF_KINDS: readonly RefKind[] = Object.freeze([
  * frozen ref model if documented; this comment is the
  * documentation. Existing ref syntax (tool / checkpoint / session /
  * file) is unchanged and remains parseable.
+ */
+
+/**
+ * CMV3-S04 change-control note:
+ *
+ * The `rollover` family was added in S04 for RolloverRequest
+ * records. The same R02 change-control rule applies. The ref is
+ * still opaque: cmv3://rollover/<id> with no payload, no project
+ * id, no command body. The id alphabet is unchanged.
  */
 
 /**

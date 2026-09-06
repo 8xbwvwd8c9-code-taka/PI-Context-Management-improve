@@ -21,31 +21,39 @@ project state as external, recoverable storage.
 
 ## Status
 
-**S03 — tool-result virtualization**
+**S04 — fresh-session rollover**
 
 This package is currently in development. It is **not published**
 to npm. It is intended to be installed from this repository once
-the runtime behavior lands in S04.
+the live integration lands in S05.
 
-S03 adds tool-result durability on top of S02:
+S04 adds safe fresh-session rollover on top of S03:
 
-- opaque tool-result refs (`cmv3://tool/<id>`)
-- durable full-byte persistence (UTF-8 text + arbitrary binary)
-- SHA-256 integrity verification on every read
-- bounded active view with head/tail preservation
-- byte-range recovery without reloading oversized payloads
-- derived `kind=tool` history index (metadata only, no raw payload)
-- index rebuild from authoritative records
-- prompt-injection-safe persistence (payload treated as inert data)
-- persistence-failure-safe active view (no ref on failure)
+- the agent-callable `picm_prepare_rollover` tool (returns an
+  opaque rollover request id)
+- the `/picm-rollover-execute <opaque-id>` command (owns the
+  `ctx.newSession` call)
+- the deterministic `agent_settled` pressure observer
+- the `RolloverRequest` durable record with state machine
+  (PREPARING → READY → EXECUTING → COMPLETE / FAILED / CANCELLED)
+- the pre-NEW hard gate (9 checks, blocks newSession on any
+  failure)
+- the in-process lock that prevents two concurrent
+  `picm_prepare_rollover` calls for the same project+session
+- a structured hydration payload that contains ONLY the
+  MinimalHandoff projection (no transcript, no raw tool output,
+  no full checkpoint)
+- the strict `v3 / v3-observe / legacy` mode semantics
+- the S03 tool-result store, available via `recovery_refs` in
+  the handoff
 
-S03 does NOT yet:
+S04 does NOT yet:
 
-- intercept live Pi tool output
-- automatically replace tool results in active context
-- create a new Pi session
-- execute rollover
-- call native Pi compaction
+- intercept live Pi tool output automatically (S05+)
+- implement semantic / vector history search
+- introduce a database dependency
+- mutate the user's Git state
+- call `ctx.compact()`
 
 Prior WPs:
 
@@ -175,8 +183,8 @@ npm run package:check
 | R02 — architecture freeze | ✅ | Frozen contracts: profiles, pressure, checkpoint, handoff, ref, tool-result, storage, modes |
 | S01 — portable package skeleton | ✅ | Combined Skill + Extension package, portable core, schemas, tests |
 | S02 — checkpoint / handoff / history | done | Durable store: checkpoints, handoffs, sessions, project metadata, history, recovery |
-| **S03 — tool-result virtualization** | **current** | Refs-backed tool result durability, integrity verification, bounded active view, on-demand recovery |
-| S04 — fresh-session rollover | next | Natural + pressure rollover orchestrator, mode-gated |
+| S03 — tool-result virtualization | done | Refs-backed tool result durability, integrity verification, bounded active view, on-demand recovery |
+| **S04 — fresh-session rollover** | **current** | Natural + pressure rollover orchestrator, deterministic state machine, pre-NEW hard gate, structured hydration, mode-gated |
 | P01 — pilot 1 | planned | First portability acceptance test (separate downstream project) |
 | P02 — pilot 2 | planned | Second portability acceptance test (separate downstream project) |
 
@@ -186,9 +194,10 @@ npm run package:check
 - `docs/STORAGE.md` — durable store model, atomicity, integrity, recovery (S02 + S03).
 - `docs/CHECKPOINT_RECOVERY.md` — checkpoint recovery contract (S02).
 - `docs/TOOL_RESULT_VIRTUALIZATION.md` — tool-result durability contract (S03).
+- `docs/FRESH_SESSION_ROLLOVER.md` — fresh-session rollover contract (S04).
 - `docs/ARCHITECTURE.md` — public high-level overview.
 - `docs/RESEARCH_PROVENANCE.md` — external research license matrix.
 
 ## License
 
-MIT (private during S03; license declared in `package.json`).
+MIT (private during S04; license declared in `package.json`).

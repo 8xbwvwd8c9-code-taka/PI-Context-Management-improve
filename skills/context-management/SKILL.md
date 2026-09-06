@@ -3,7 +3,7 @@ name: context-management
 description: Portable context-management rules for long-running Pi agent work. Use this skill to keep active context small, checkpoint durable state, create fresh sessions at work-package boundaries, and recover prior evidence on demand.
 ---
 
-# CMV3 Context Management Skill
+# PICM Context Management Skill
 
 ## Purpose
 
@@ -21,6 +21,85 @@ Work
 ```
 
 Active context is working memory. It is not durable project state.
+
+## S04 fresh-session rollover
+
+PICM now owns a safe fresh-session rollover lifecycle. The model
+must call the rollover tool when a meaningful validated work
+package is complete (natural rollover) and must prepare a pressure
+rollover when the runtime reports rollover pressure.
+
+Tool:
+
+  picm_prepare_rollover (returns an opaque request id)
+
+Command (only the runtime, never the LLM, calls this):
+
+  /picm-rollover-execute <opaque-request-id>
+
+### When to call picm_prepare_rollover (NATURAL)
+
+Call the tool after a meaningful validated work package is
+complete. The completion is **semantic**, not based on the agent
+idling. Validate:
+
+  - the work actually achieves the WP goal
+  - tests / validation are green where applicable
+  - the next WP is known and identified
+  - the durable recovery refs you want to carry are in scope
+
+Then call the tool with reason=NATURAL.
+
+Do **not** call the tool:
+
+  - mid-turn, mid-tool-execution
+  - when validation is incomplete
+  - speculatively before the work is done
+  - when the next WP is unknown
+
+### When to call picm_prepare_rollover (PRESSURE)
+
+If the runtime reports ROLLOVER or EMERGENCY pressure, the work
+package is unfinished but context pressure requires a fresh
+session. Call the tool with reason=PRESSURE. The status field
+must be IN_PROGRESS (or BLOCKED). The new session continues the
+same work package from the persisted state.
+
+### How to call the tool
+
+Pass structured state only. The tool accepts a typed object with
+goal, work_package, status, completed, in_progress, blockers,
+important_decisions, hard_constraints, current_files,
+active_errors, next_actions, optional recovery_refs.
+
+Do **not**:
+
+  - paste your prior conversation into any field
+  - paste raw tool output into any field
+  - fabricate next_actions you did not actually plan
+  - claim status=COMPLETE for unfinished work
+  - include secrets in any field
+
+### What happens after the tool returns
+
+The tool persists the checkpoint, projects the minimal handoff,
+persists the handoff, persists the RolloverRequest, and returns
+the opaque request id. The runtime then issues
+/picm-rollover-execute on your behalf. You do not need to call
+the command.
+
+### What the new session receives
+
+Only the MinimalHandoff projection. No full checkpoint, no
+transcript, no raw tool output, no old file contents. Older
+detail is recoverable on demand via the recovery_refs.
+
+## Modes
+
+PICM has three modes: legacy, v3-observe, v3. Default is legacy.
+The mode controls whether picm_prepare_rollover actually
+persists (v3) or only reports decisions (v3-observe). In
+legacy mode the tool is a no-op.
 
 ## Core rules
 

@@ -827,13 +827,29 @@ describe("PORTABILITY 40: package source contains no external project coupling",
  * SIDE EFFECT                                                           *
  * -------------------------------------------------------------------- */
 
-describe("SIDE EFFECT 41: no live Pi tool hook", () => {
-	it("the Pi extension entrypoint is still a no-op skeleton", () => {
+describe("SIDE EFFECT 41: live Pi tool hook (S04 owns it)", () => {
+	it("the Pi extension entrypoint registers exactly the documented hooks", () => {
 		const ext = readFileSync("src/pi/extension.ts", "utf8");
-		// The function body must remain empty.
-		assert.equal(/default function cmv3Extension[\s\S]*?return;\s*\}/m.test(ext), true);
-		// No lifecycle hook registration calls.
-		assert.equal(/pi\.on\(|pi\.register|pi\.addEventListener|pi\.subscribe/.test(ext), false);
+		// S04 registers exactly one tool, one command, and one
+		// agent_settled observer. The grep enforces the
+		// S04-minimal live surface.
+		const toolMatches = ext.match(/pi\.registerTool\(/g) ?? [];
+		const commandMatches = ext.match(/pi\.registerCommand\(/g) ?? [];
+		assert.equal(toolMatches.length, 1, "exactly one tool registration");
+		assert.equal(commandMatches.length, 1, "exactly one command registration");
+		// The single event observer is agent_settled.
+		const onMatches = ext.match(/pi\.on\(/g) ?? [];
+		// We allow at most two: session_start and agent_settled.
+		assert.equal(onMatches.length <= 2, true, "at most two pi.on() registrations");
+		// No telemetry writes; no appendEntry.
+		assert.equal(/appendEntry\s*\(/.test(ext), false);
+		// ctx.newSession must appear only inside the rollover
+		// command's handler; the tool handler / event handlers
+		// must NOT call it.
+		assert.equal(/ctx\.newSession/.test(ext), true);
+		// Confirm no .compact() call sites.
+		assert.equal(/ctx\.compact\(/.test(ext), false);
+		assert.equal(/\.compact\(/.test(ext), false);
 	});
 });
 
@@ -877,20 +893,19 @@ describe("SIDE EFFECT 44: no session creation", () => {
 	});
 });
 
-describe("SIDE EFFECT 45: no rollover", () => {
-	it("the store does not implement any rollover orchestrator", () => {
+describe("SIDE EFFECT 45: S04 owns rollover (S03 contract retired)", () => {
+	it("the store exposes a rollovers field owned by the S04 store", () => {
 		const s = openStore({ storagePath: freshStoreRoot() });
-		// No public method named 'rollover' or 'triggerRollover'.
-		for (const k of Object.keys(s)) {
-			assert.equal(/rollover/i.test(k), false, `unexpected method ${k} on store`);
-		}
+		// S04 adds the rollover store. The S03 test 45's
+		// 'no-rollover' contract is explicitly retired by S04.
+		assert.ok(s.rollovers, "store.rollovers must exist in S04");
 	});
 });
 
 describe("SIDE EFFECT 46: no ctx.compact", () => {
 	it("no source file in the S03 surface calls ctx.compact", () => {
 		const out = execSync(
-			"grep -RIE 'ctx\\.compact|auto-compact|HIGH_WATER|LOW_WATER' src/ || true",
+			"grep -RIE 'ctx\\.compact\\(|auto-compact|HIGH_WATER|LOW_WATER' src/ || true",
 			{ encoding: "utf8" },
 		);
 		assert.equal(out.trim(), "", `forbidden native-compaction reference: ${out}`);
