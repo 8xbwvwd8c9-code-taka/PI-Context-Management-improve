@@ -39,15 +39,42 @@
  */
 import { openStore } from "../store/index.js";
 import { generateId } from "../store/ids.js";
-import { buildHydrationPayload, createRolloverOrchestrator, projectHandoffFromCheckpoint, requireRolloverRef, resolveConfig, } from "../core/index.js";
+import {
+    buildHydrationPayload,
+    createRolloverOrchestrator,
+    projectHandoffFromCheckpoint,
+    requireRolloverRef,
+    resolveConfig,
+} from "../core/index.js";
 import { LOCAL_32K_PROFILE } from "../core/index.js";
 import { RECOVERY_TOOL_NAME, executePicmRecover } from "./recovery-tool.js";
-import { computeLivePressure, LIVE_PRESSURE_HOOK_NAME, } from "./pressure-live.js";
-import { LIVE_SESSION_START_HOOK_NAME, resolveLiveRuntime, } from "./session-init.js";
-import { failOpenForPersistenceError, virtualizeToolResult, } from "./tool-result-live.js";
-import { classifyPrepareOutcome, shouldTriggerPressureRollover, PressureTriggerMachine, } from "./pressure-trigger.js";
+import {
+    computeLivePressure,
+    LIVE_PRESSURE_HOOK_NAME,
+} from "./pressure-live.js";
+import {
+    LIVE_SESSION_START_HOOK_NAME,
+    resolveLiveRuntime,
+} from "./session-init.js";
+import {
+    consoleDiagnosticSink,
+    reconcileInterruptedRollovers,
+} from "./reconcile.js";
+import { createFsJsonlParentScanner } from "./jsonl-parent-scanner.js";
+import {
+    failOpenForPersistenceError,
+    virtualizeToolResult,
+} from "./tool-result-live.js";
+import {
+    classifyPrepareOutcome,
+    shouldTriggerPressureRollover,
+    PressureTriggerMachine,
+} from "./pressure-trigger.js";
 import { RolloverOrchestratorError } from "../core/rollover-orchestrator.js";
-import { ToolResultAccessError, ToolResultPersistenceError, } from "../store/tool-result-store.js";
+import {
+    ToolResultAccessError,
+    ToolResultPersistenceError,
+} from "../store/tool-result-store.js";
 /** Package identity. Mirrored from package.json for runtime introspection. */
 export const PACKAGE_NAME = "pi-context-management-improve";
 export const PACKAGE_VERSION = "1.0.1";
@@ -83,8 +110,7 @@ export default function cmv3Extension(pi) {
     // for the lifetime of one extension instance.
     let storeRef = null;
     const getStore = () => {
-        if (storeRef !== null)
-            return storeRef;
+        if (storeRef !== null) return storeRef;
         storeRef = openStore();
         return storeRef;
     };
@@ -101,12 +127,12 @@ export default function cmv3Extension(pi) {
     // retained in the map for inspection (and are cleared when
     // `session_start` fires for that exact key).
     const pressureMachines = new Map();
-    const pressureMachineKey = (projectId, sessionId) => `${projectId}::${sessionId}`;
+    const pressureMachineKey = (projectId, sessionId) =>
+        `${projectId}::${sessionId}`;
     const getPressureMachine = () => {
         const projectId = currentProjectId;
         const sessionId = currentSessionId;
-        if (projectId === null || sessionId === null)
-            return null;
+        if (projectId === null || sessionId === null) return null;
         const key = pressureMachineKey(projectId, sessionId);
         let m = pressureMachines.get(key);
         if (m === undefined) {
@@ -115,6 +141,13 @@ export default function cmv3Extension(pi) {
         }
         return m;
     };
+    // P04 — interrupted-rollover recovery. The scanner is
+    // filesystem-backed by default; tests inject a stub via the
+    // `cmv3SetReconcileScanner` test-only setter (see end of
+    // file). The sink is console-backed in production and
+    // overridable via `cmv3SetReconcileSink` for tests.
+    const reconcileScanner = createFsJsonlParentScanner();
+    const reconcileSink = consoleDiagnosticSink();
     // ------------------------------------------------------------------
     // 0) session_start: resolve mode / profile / project / session
     // ------------------------------------------------------------------
@@ -122,25 +155,59 @@ export default function cmv3Extension(pi) {
         const cwd = ctx.cwd;
         const ev = event;
         const previousSessionFile = ev.previousSessionFile;
+        const startReason = event.reason ?? "startup";
         // The runtime may not expose the active model's context
         // window yet (it may be null right at start). We pass
         // `undefined` to let the session-init helper default to
         // the local_32k profile. The first `agent_settled` event
         // will supply a real value (if available).
-        const initial = resolveLiveRuntime({
-            cwd,
-            previousSessionFile,
-        }, getStore());
+        const initial = resolveLiveRuntime(
+            {
+                cwd,
+                previousSessionFile,
+            },
+            getStore(),
+        );
         resolvedConfig = initial.config;
         activeProfile = initial.profile;
         currentProjectId = initial.projectId;
         currentSessionId = initial.oldSessionId;
+        // P04: on Pi startup, reconcile any RolloverRequest
+        // stuck in EXECUTING. Per the WP, this runs ONLY when
+        // the runtime reports `reason === "startup"`. For
+        // `new` / `resume` / `fork` / `reload`, a rollover in
+        // EXECUTING is LEGITIMATELY in flight (e.g. the
+        // slash command's `withSession` is mid-write) and
+        // must NOT be touched. The reconcile call NEVER
+        // invokes `ctx.newSession()`; it only writes
+        // EXECUTING -> COMPLETE / FAILED transitions through
+        // the S04 store.
+        if (startReason === "startup") {
+            try {
+                reconcileInterruptedRollovers({
+                    projectId: initial.projectId,
+                    oldSessionId: initial.oldSessionId,
+                    store: getStore(),
+                    jsonlScanner: reconcileScanner,
+                    sink: reconcileSink,
+                });
+            } catch {
+                // The reconciler is bounded: its own outer
+                // try/catch converts exceptions into a
+                // diagnostic. Anything that escapes here is a
+                // programmer error; swallow it so the
+                // session_start pipeline completes.
+            }
+        }
         // S05A: a new (project, session) starts with a fresh
         // pressure-trigger machine. Any prior machine for this
         // exact key is reset; machines for prior keys are
         // retained for diagnostics.
         const key = pressureMachineKey(initial.projectId, initial.oldSessionId);
-        pressureMachines.set(key, new PressureTriggerMachine(initial.projectId, initial.oldSessionId));
+        pressureMachines.set(
+            key,
+            new PressureTriggerMachine(initial.projectId, initial.oldSessionId),
+        );
         void LIVE_SESSION_START_HOOK_NAME;
     });
     // ------------------------------------------------------------------
@@ -149,8 +216,10 @@ export default function cmv3Extension(pi) {
     pi.registerTool({
         name: RECOVERY_TOOL_NAME,
         label: "PICM recover tool result",
-        description: "Read a previously persisted tool result by its cmv3://tool/<id> ref. Optional byte range. The recovery tool's output is bounded.",
-        promptSnippet: "Recover a tool result from a cmv3://tool/<id> ref with optional byte range.",
+        description:
+            "Read a previously persisted tool result by its cmv3://tool/<id> ref. Optional byte range. The recovery tool's output is bounded.",
+        promptSnippet:
+            "Recover a tool result from a cmv3://tool/<id> ref with optional byte range.",
         promptGuidelines: [
             "Use picm_recover when a tool result was virtualized and the bounded active view is not enough.",
             "picm_recover accepts ONLY a cmv3://tool/<id> ref (or bare id) and a bounded byte range. It refuses arbitrary paths.",
@@ -176,7 +245,8 @@ export default function cmv3Extension(pi) {
                     content: [
                         {
                             type: "text",
-                            text: "PICM mode is legacy; recovery surface is disabled. " +
+                            text:
+                                "PICM mode is legacy; recovery surface is disabled. " +
                                 "Set CMV3_MODE=v3 (or v3-observe) to enable.",
                         },
                     ],
@@ -201,8 +271,7 @@ export default function cmv3Extension(pi) {
                     store: getStore(),
                 });
                 return { content: [out.content], details: out.details };
-            }
-            catch (err) {
+            } catch (err) {
                 if (err instanceof ToolResultAccessError) {
                     return {
                         content: [
@@ -224,8 +293,10 @@ export default function cmv3Extension(pi) {
     pi.registerTool({
         name: ROLLOVER_TOOL_NAME,
         label: "PICM prepare rollover",
-        description: "Persists checkpoint, projects MinimalHandoff, and creates a RolloverRequest for the /picm-rollover-execute command. Does NOT call newSession.",
-        promptSnippet: "Persist checkpoint + handoff and queue a follow-up rollover command.",
+        description:
+            "Persists checkpoint, projects MinimalHandoff, and creates a RolloverRequest for the /picm-rollover-execute command. Does NOT call newSession.",
+        promptSnippet:
+            "Persist checkpoint + handoff and queue a follow-up rollover command.",
         promptGuidelines: [
             "Use picm_prepare_rollover after a meaningful validated work package is complete (NATURAL) or when the runtime reports rollover pressure (PRESSURE).",
             "picm_prepare_rollover does NOT replace the session. It only persists durable state and returns an opaque request id; /picm-rollover-execute owns the actual session replacement.",
@@ -243,7 +314,10 @@ export default function cmv3Extension(pi) {
                 completed: { type: "array", items: { type: "string" } },
                 in_progress: { type: "array", items: { type: "string" } },
                 blockers: { type: "array", items: { type: "string" } },
-                important_decisions: { type: "array", items: { type: "string" } },
+                important_decisions: {
+                    type: "array",
+                    items: { type: "string" },
+                },
                 hard_constraints: { type: "array", items: { type: "string" } },
                 current_files: { type: "array", items: { type: "string" } },
                 active_errors: { type: "array", items: { type: "string" } },
@@ -280,7 +354,7 @@ export default function cmv3Extension(pi) {
             // SAFETY: the tool's parameters schema is the LLM-facing
             // boundary; the runtime hands us the parsed object. We
             // re-narrow to the tool-specific shape here.
-            const a = (args ?? {});
+            const a = args ?? {};
             if (resolvedConfig === null) {
                 resolvedConfig = resolveConfig({});
             }
@@ -289,7 +363,8 @@ export default function cmv3Extension(pi) {
                     content: [
                         {
                             type: "text",
-                            text: "PICM mode is legacy; rollover preparation is a no-op. " +
+                            text:
+                                "PICM mode is legacy; rollover preparation is a no-op. " +
                                 "Set CMV3_MODE=v3 (or v3-observe) to enable.",
                         },
                     ],
@@ -376,24 +451,29 @@ export default function cmv3Extension(pi) {
                     recovery_refs: cp.recovery_refs,
                     now,
                 });
-            }
-            catch (err) {
+            } catch (err) {
                 if (pmForPrepare !== null && a.reason === "PRESSURE") {
-                    const failure_code = err instanceof RolloverOrchestratorError
-                        ? err.failure_code
-                        : "unknown";
-                    pmForPrepare.applyPrepareOutcome(classifyPrepareOutcome({ ok: false, failure_code }));
+                    const failure_code =
+                        err instanceof RolloverOrchestratorError
+                            ? err.failure_code
+                            : "unknown";
+                    pmForPrepare.applyPrepareOutcome(
+                        classifyPrepareOutcome({ ok: false, failure_code }),
+                    );
                 }
                 throw err;
             }
             if (pmForPrepare !== null && a.reason === "PRESSURE") {
-                pmForPrepare.applyPrepareOutcome(classifyPrepareOutcome({ ok: true }));
+                pmForPrepare.applyPrepareOutcome(
+                    classifyPrepareOutcome({ ok: true }),
+                );
             }
             return {
                 content: [
                     {
                         type: "text",
-                        text: `PICM rollover prepared.\n` +
+                        text:
+                            `PICM rollover prepared.\n` +
                             `ref: ${out.ref}\n` +
                             `reason: ${a.reason}\n` +
                             `state: ${out.request.state}\n` +
@@ -408,7 +488,8 @@ export default function cmv3Extension(pi) {
     // 3) Custom command: /picm-rollover-execute (S04, preserved)
     // ------------------------------------------------------------------
     pi.registerCommand(ROLLOVER_COMMAND_NAME, {
-        description: "Execute a prepared PICM rollover. The argument is the opaque rollover request id (no checkpoint body, no handoff body, no file content).",
+        description:
+            "Execute a prepared PICM rollover. The argument is the opaque rollover request id (no checkpoint body, no handoff body, no file content).",
         handler: async (args, ctx) => {
             const reply = (msg) => {
                 ctx.ui.notify(msg, "info");
@@ -417,7 +498,9 @@ export default function cmv3Extension(pi) {
                 resolvedConfig = resolveConfig({});
             }
             if (resolvedConfig.mode !== "v3") {
-                reply(`PICM mode is ${resolvedConfig.mode}; refuse to call newSession.`);
+                reply(
+                    `PICM mode is ${resolvedConfig.mode}; refuse to call newSession.`,
+                );
                 return;
             }
             const trimmed = args.trim();
@@ -432,16 +515,13 @@ export default function cmv3Extension(pi) {
                 if (trimmed.startsWith("cmv3://")) {
                     const parsed = requireRolloverRef(trimmed);
                     id = parsed.id;
-                }
-                else if (/^[a-z0-9_-]{8,128}$/.test(trimmed)) {
+                } else if (/^[a-z0-9_-]{8,128}$/.test(trimmed)) {
                     id = trimmed;
-                }
-                else {
+                } else {
                     reply(`Invalid rollover request id syntax: ${trimmed}`);
                     return;
                 }
-            }
-            catch (err) {
+            } catch (err) {
                 reply(`Invalid rollover request id: ${err.message}`);
                 return;
             }
@@ -449,20 +529,25 @@ export default function cmv3Extension(pi) {
             const projectId = currentProjectId;
             const oldSessionId = currentSessionId;
             if (projectId === null || oldSessionId === null) {
-                reply("PICM rollover requires a known project / session; none available.");
+                reply(
+                    "PICM rollover requires a known project / session; none available.",
+                );
                 return;
             }
             const ref = `cmv3://rollover/${id}`;
             let request;
             try {
                 request = store.rollovers.read(ref, projectId);
-            }
-            catch (err) {
-                reply(`Rollover request not found or unreadable: ${err.message}`);
+            } catch (err) {
+                reply(
+                    `Rollover request not found or unreadable: ${err.message}`,
+                );
                 return;
             }
-            if (request.project_id !== projectId ||
-                request.old_session_id !== oldSessionId) {
+            if (
+                request.project_id !== projectId ||
+                request.old_session_id !== oldSessionId
+            ) {
                 reply("Rollover identity mismatch (project or session).");
                 return;
             }
@@ -477,11 +562,16 @@ export default function cmv3Extension(pi) {
             if (request.state === "FAILED" && request.failure_code !== null) {
                 // Allow retry: a FAILED state may transition to
                 // PREPARING -> READY through a fresh request.
-                reply(`Rollover ${id} is FAILED; create a new rollover request to retry.`);
+                reply(
+                    `Rollover ${id} is FAILED; create a new rollover request to retry.`,
+                );
                 return;
             }
             // Pre-NEW hard gate.
-            const cp = store.checkpoints.read(request.checkpoint_ref, projectId);
+            const cp = store.checkpoints.read(
+                request.checkpoint_ref,
+                projectId,
+            );
             const ho = store.handoffs.read(request.handoff_ref, projectId);
             const orchestrator = createRolloverOrchestrator(store);
             const gate = orchestrator.preNewGate({
@@ -500,13 +590,17 @@ export default function cmv3Extension(pi) {
                     failureCode: gate.failure_code,
                     failureDetail: gate.detail,
                 });
-                reply(`Pre-NEW gate failed: ${gate.failure_code} (${gate.detail})`);
+                reply(
+                    `Pre-NEW gate failed: ${gate.failure_code} (${gate.detail})`,
+                );
                 return;
             }
             // Idempotency: if the request is already EXECUTING, we
             // refuse to start a second concurrent newSession.
             if (request.state !== "READY") {
-                reply(`Rollover ${id} is in state ${request.state}; cannot execute.`);
+                reply(
+                    `Rollover ${id} is in state ${request.state}; cannot execute.`,
+                );
                 return;
             }
             // Move to EXECUTING.
@@ -531,7 +625,8 @@ export default function cmv3Extension(pi) {
                     // captured `ctx` and `pi` from the outer
                     // closure are stale; we deliberately do not
                     // touch them.
-                    const newSessionFile = freshCtx.sessionManager.getSessionFile();
+                    const newSessionFile =
+                        freshCtx.sessionManager.getSessionFile();
                     const newSessionId = newSessionFile ?? "new-session";
                     const ts = new Date().toISOString();
                     // P01 corrective: `oldSessionId` is set
@@ -545,32 +640,113 @@ export default function cmv3Extension(pi) {
                     // and extension. If the result is empty
                     // (which only happens for the synthetic
                     // `current` sentinel), fall back to null.
-                    const oldSessionBasename = oldSessionId.split("/").pop() ?? "";
-                    const oldSessionIdBare = oldSessionBasename.replace(/\.json$/, "");
-                    const previous_session_ref = oldSessionIdBare.length === 0 || oldSessionIdBare === "current"
-                        ? null
-                        : `cmv3://session/${oldSessionIdBare}`;
+                    const oldSessionBasename =
+                        oldSessionId.split("/").pop() ?? "";
+                    const oldSessionIdBare = oldSessionBasename.replace(
+                        /\.json$/,
+                        "",
+                    );
+                    const previous_session_ref =
+                        oldSessionIdBare.length === 0 ||
+                        oldSessionIdBare === "current"
+                            ? null
+                            : `cmv3://session/${oldSessionIdBare}`;
                     // Persist a new session record.
-                    store.sessions.write({
-                        schema_version: "1.0.0",
-                        session_id: newSessionId,
-                        project_id: projectId,
-                        started_at: ts,
-                        status: "OPEN",
-                        checkpoint_refs: [request.checkpoint_ref],
-                        handoff_refs: [request.handoff_ref],
-                        previous_session_ref,
-                        next_session_ref: null,
-                    }, { projectId });
+                    store.sessions.write(
+                        {
+                            schema_version: "1.0.0",
+                            session_id: newSessionId,
+                            project_id: projectId,
+                            started_at: ts,
+                            status: "OPEN",
+                            checkpoint_refs: [request.checkpoint_ref],
+                            handoff_refs: [request.handoff_ref],
+                            previous_session_ref,
+                            next_session_ref: null,
+                        },
+                        { projectId },
+                    );
                     store.rollovers.transition({
                         projectId,
                         ref,
                         to: "COMPLETE",
                         newSessionId,
                     });
-                    // Kick the new session off on the structured
-                    // handoff.
-                    await freshCtx.sendUserMessage(`Continuing ${ho.work_package}. ${hydration.text.split("\n")[0]}`);
+                    // P03 corrective: `freshCtx.sendUserMessage`
+                    // awaits the new session's full agent turn
+                    // (prompt -> LLM -> response). Awaiting it
+                    // inside `withSession` blocked the old
+                    // slash command's `await ctx.newSession()`
+                    // indefinitely, and on rate-limited models
+                    // the old TUI was held hostage while the
+                    // new TUI tried to render in the same PTY.
+                    // The handoff itself is already persisted as
+                    // the first user message in the new session
+                    // by `setup` above; `sendUserMessage` here
+                    // is only the kickoff prompt that asks the
+                    // new agent to begin work on the handoff.
+                    // Fire it without awaiting; attach a
+                    // bounded error logger so failures are
+                    // visible (NOT silent). Rollover state is
+                    // already COMPLETE — the new session was
+                    // successfully created, the handoff is
+                    // durable, and a kickoff failure is
+                    // recoverable by the user re-submitting.
+                    const kickoff = freshCtx.sendUserMessage(
+                        `Continuing ${ho.work_package}. ${hydration.text.split("\n")[0]}`,
+                    );
+                    kickoff.catch((err) => {
+                        // ponytail: best-effort kickoff logger.
+                        // The new session is fully active at
+                        // the point this catch runs (the old
+                        // session is invalidated and the new
+                        // TUI is bound). We surface the error
+                        // through the replaced context's
+                        // public UI: a notification in the new
+                        // TUI is observable, and Pi itself
+                        // will not crash on a notify call.
+                        // SAFETY: `ui` is a public getter on
+                        // the replaced context (see Pi's
+                        // `ExtensionRunner.createContext`,
+                        // which is re-used by
+                        // `createReplacedSessionContext`).
+                        // `hasUI` is a guarded check; the
+                        // runner's `assertActive()` runs on
+                        // every access and is valid because
+                        // the new session is the active
+                        // runner at the time this catch
+                        // fires. If `hasUI` is false, the
+                        // notify is silently skipped.
+                        const message =
+                            err instanceof Error ? err.message : String(err);
+                        try {
+                            // SAFETY: `ui` and `hasUI` are public
+                            // members of the replaced context's
+                            // underlying ExtensionContext (Pi's
+                            // `runner.createContext` at
+                            // `dist/core/extensions/runner.js`).
+                            // The re-type only narrows the public
+                            // shape to the methods we actually
+                            // call, and the chained `try` plus
+                            // `hasUI?.()` guard short-circuits if
+                            // either is unavailable.
+                            const ui = freshCtx;
+                            if (ui.hasUI?.() && ui.ui?.notify) {
+                                ui.ui.notify(
+                                    `PICM rollover kickoff failed (new session is ready, handoff persisted): ${message}`,
+                                    "warning",
+                                );
+                            }
+                        } catch {
+                            // The notification itself failed
+                            // (e.g. the new session was torn
+                            // down before the catch fired).
+                            // The new session file is durable
+                            // and the user can re-submit the
+                            // kickoff message; nothing more
+                            // we can do here.
+                        }
+                    });
                 },
             });
             if (result.cancelled) {
@@ -631,8 +807,7 @@ export default function cmv3Extension(pi) {
                 mode: resolvedConfig.mode,
                 store: getStore(),
             });
-        }
-        catch (err) {
+        } catch (err) {
             // The helper throws only on a persistence error.
             // We fail-open: return the original event content
             // unchanged; the diagnostic is recorded as
@@ -678,11 +853,15 @@ export default function cmv3Extension(pi) {
             // driven by the physical cap. The resolver is pure
             // and idempotent; the only side effect here is
             // updating the per-extension `activeProfile`.
-            const r = resolveLiveRuntime({
-                cwd: ctx.cwd,
-                contextWindow: live.contextWindow,
-                previousSessionFile: ctx.sessionManager.getSessionFile() ?? undefined,
-            }, getStore());
+            const r = resolveLiveRuntime(
+                {
+                    cwd: ctx.cwd,
+                    contextWindow: live.contextWindow,
+                    previousSessionFile:
+                        ctx.sessionManager.getSessionFile() ?? undefined,
+                },
+                getStore(),
+            );
             activeProfile = r.profile;
         }
         const usage = {
@@ -722,15 +901,18 @@ export default function cmv3Extension(pi) {
                 machine: pm,
             });
             if (trig.shouldSend && trig.call !== null) {
-                pi.sendMessage({
-                    customType: trig.call.message.customType,
-                    content: trig.call.message.content,
-                    display: trig.call.message.display,
-                    details: trig.call.message.details,
-                }, {
-                    triggerTurn: trig.call.options.triggerTurn,
-                    deliverAs: trig.call.options.deliverAs,
-                });
+                pi.sendMessage(
+                    {
+                        customType: trig.call.message.customType,
+                        content: trig.call.message.content,
+                        display: trig.call.message.display,
+                        details: trig.call.message.details,
+                    },
+                    {
+                        triggerTurn: trig.call.options.triggerTurn,
+                        deliverAs: trig.call.options.deliverAs,
+                    },
+                );
                 pm.markSent();
             }
         }
@@ -744,5 +926,15 @@ export { RECOVERY_TOOL_NAME as PICM_RECOVER_TOOL_NAME } from "./recovery-tool.js
 export { LIVE_TOOL_RESULT_HOOK_NAME } from "./tool-result-live.js";
 // S05A: re-export the pressure-trigger surface so tests can
 // drive the live handler through the public extension barrel.
-export { PICM_PRESSURE_CUSTOM_TYPE, FIXED_TRUSTED_PICM_DIRECTIVE, PRESSURE_ROLLOVER_OPTIONS, PRESSURE_DIRECTIVE_DENY_SUBSTRINGS, PressureTriggerMachine, buildPressureRolloverMessage, buildPressureRolloverCall, shouldTriggerPressureRollover, classifyPrepareOutcome, } from "./pressure-trigger.js";
+export {
+    PICM_PRESSURE_CUSTOM_TYPE,
+    FIXED_TRUSTED_PICM_DIRECTIVE,
+    PRESSURE_ROLLOVER_OPTIONS,
+    PRESSURE_DIRECTIVE_DENY_SUBSTRINGS,
+    PressureTriggerMachine,
+    buildPressureRolloverMessage,
+    buildPressureRolloverCall,
+    shouldTriggerPressureRollover,
+    classifyPrepareOutcome,
+} from "./pressure-trigger.js";
 //# sourceMappingURL=extension.js.map
